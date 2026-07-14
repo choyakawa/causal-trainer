@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "causal-trainer"
+version = "0.1.0"
+description = "Distributed JAX platform for CausalLM model training on Cloud TPU."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = [
+  "datasets>=3.6.0",
+  "huggingface-hub>=0.33.0",
+  "jinja2>=3.1",
+  "jax~=0.10.2",
+  "jaxlib~=0.10.2",
+  "ml-dtypes>=0.5.0",
+  "numpy>=1.26",
+  "optax>=0.2.2",
+  "safetensors>=0.5.0",
+  "tokenizers~=0.22.2",
+  "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+tpu = ["jax[tpu]~=0.10.2"]
+wandb = ["wandb>=0.18.5"]
+test = ["pytest>=8.0", "ruff>=0.11"]
+
+[project.scripts]
+causal-train = "causal_trainer.train:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "RUF"]

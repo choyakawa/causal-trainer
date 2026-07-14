@@ -1,0 +1,689 @@
+import pytest
+
+from causal_trainer.training.arguments import build_parser, parse_args
+from causal_trainer.training.runner import _resolve_loss_implementation
+
+
+def test_cli_accepts_reference_boolean_style() -> None:
+    args = parse_args(
+        [
+            "--repo_id",
+            "local-model",
+            "--dataset_name",
+            "local-data",
+            "--packing",
+            "True",
+            "--assistant_only_loss",
+            "False",
+            "--sharding_axis",
+            "-1,1,1,4,1",
+        ]
+    )
+    assert args.packing is True
+    assert args.assistant_only_loss is False
+    assert args.sharding_axis == "-1,1,1,4,1"
+    assert args.attn_mechanism == "efficient"
+    assert args.loss_implementation == "auto"
+    assert args.loss_token_budget == 128
+    assert args.mlp_chunk_size == 1024
+    assert args.scan_layers is False
+    assert args.async_dispatch_steps == 2
+    assert args.prefetch_batches == 1
+    assert args.logging_steps == 10
+
+
+def test_cli_does_not_expose_remote_tokenizer_code_execution() -> None:
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--repo-id",
+                "local-model",
+                "--dataset-name",
+                "local-data",
+                "--trust-remote-code",
+                "True",
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    "training_mode_args",
+    [
+        [],
+        ["--lora", "True"],
+        ["--lora", "True", "--lora-train-embed-and-lm-head", "True"],
+    ],
+    ids=["full", "lora", "lora_with_embed_and_head"],
+)
+def test_loss_implementation_auto_uses_cut_for_a_compatible_mesh(
+    training_mode_args: list[str],
+) -> None:
+    args = parse_args(
+        ["--repo-id", "local-model", "--dataset-name", "local-data", *training_mode_args]
+    )
+    assert _resolve_loss_implementation(args, "tpu") == "cut"
+
+
+@pytest.mark.parametrize(
+    "training_mode_args",
+    [
+        [],
+        ["--lora", "True"],
+        ["--lora", "True", "--lora-train-embed-and-lm-head", "True"],
+    ],
+    ids=["full", "lora", "lora_with_embed_and_head"],
+)
+def test_loss_implementation_auto_uses_pallas_for_an_incompatible_mesh(
+    training_mode_args: list[str],
+) -> None:
+    args = parse_args(
+        ["--repo-id", "local-model", "--dataset-name", "local-data", *training_mode_args]
+    )
+    assert (
+        _resolve_loss_implementation(args, "tpu", cut_mesh_supported=False) == "pallas"
+    )
+
+
+@pytest.mark.parametrize("implementation", ["cut", "pallas", "xla"])
+def test_explicit_loss_selection_is_unchanged_by_mesh_compatibility(
+    implementation: str,
+) -> None:
+    args = parse_args(
+        [
+            "--repo-id",
+            "local-model",
+            "--dataset-name",
+            "local-data",
+            "--loss-implementation",
+            implementation,
+        ]
+    )
+    assert (
+        _resolve_loss_implementation(args, "tpu", cut_mesh_supported=False)
+        == implementation
+    )
+
+
+def test_training_rejects_non_tpu_backend() -> None:
+    args = parse_args(
+        [
+            "--repo-id",
+            "local-model",
+            "--dataset-name",
+            "local-data",
+            "--loss-implementation",
+            "pallas",
+        ]
+    )
+    with pytest.raises(ValueError, match="requires a TPU"):
+        _resolve_loss_implementation(args, "cpu")
+
+
+def test_cli_accepts_bare_boolean_and_hyphenated_names() -> None:
+    args = parse_args(
+        [
+            "--repo-id",
+            "local-model",
+            "--dataset-name",
+            "local-data",
+            "--packing",
+            "--no-shuffle",
+        ]
+    )
+    assert args.packing is True
+    assert args.shuffle is False
+
+
+def test_save_optimizer_state_defaults_to_false() -> None:
+    args = parse_args(["--repo-id", "local-model", "--dataset-name", "local-data"])
+    assert args.save_optimizer_state is False
+    assert args.endprompt_enable is False
+    assert args.lora_train_embed_and_lm_head is False
+    assert args.preprocessing_mode == "shard_then_merge"
+    assert args.sharding_axis == "-1,1,1,4,1"
+
+
+@pytest.mark.parametrize(
+    "max_sequence_length",
+    [2, 512, 2048, 4095, 131072, 262144, 524288],
+)
+def test_full_training_automatically_disables_mlp_tiling_outside_target_range(
+    max_sequence_length: int,
+) -> None:
+    args = parse_args(
+        [
+            "--repo-id",
+            "local-model",
+            "--dataset-name",
+            "local-data",
+            "--max-sequence-length",
+            str(max_sequence_length),
+        ]
+    )
+    assert args.mlp_chunk_size == 0
+
+
+@pytest.mark.parametrize("max_sequence_length", [4096, 8192, 131071])
+def test_full_training_automatically_enables_mlp_tiling_in_target_range(
+    max_sequence_length: int,
+) -> None:
+    args = parse_args(
+        [
+            "--repo-id",
+            "local-model",
+            "--dataset-name",
+            "local-data",
+            "--max-sequence-length",
+            str(max_sequence_length),
+        ]
+    )
+    assert args.mlp_chunk_size == 1024
+
+
+def test_sequence_parallel_training_automatically_disables_mlp_tiling() -> None:
+    args = parse_args(
+        [
+            "--repo-id",
+            "local-model",
+            "--dataset-name",
+            "local-data",
+            "--max-sequence-length",
+            "8192",
+            "--sharding-axis",
+            "4,1,1,4,2",
+        ]
+    )
+    assert args.mlp_chunk_size == 0
+
+
+@pytest.mark.parametrize("train_embed_and_head", [False, True])
+def test_lora_automatically_disables_mlp_tiling(
+    train_embed_and_head: bool,
+) -> None:
+    command = [
+        "--repo-id",
+        "local-model",
+        "--dataset-name",
+        "local-data",
+        "--max-sequence-length",
+        "131072",
+        "--lora",
+        "True",
+    ]
+    if train_embed_and_head:
+        command.extend(["--lora-train-embed-and-lm-head", "True"])
+    args = parse_args(command)
+    assert args.mlp_chunk_size == 0
+
+
+@pytest.mark.parametrize(
+    ("training_mode_args", "max_sequence_length", "mlp_chunk_size"),
+    [
+        ([], 512, 1024),
+        ([], 131072, 0),
+        (["--lora", "True"], 131072, 2048),
+        (["--sharding-axis", "4,1,1,4,2"], 8192, 2048),
+    ],
+    ids=["full_short", "full_long", "lora_long", "sequence_parallel"],
+)
+def test_explicit_mlp_chunk_size_overrides_automatic_selection(
+    training_mode_args: list[str],
+    max_sequence_length: int,
+    mlp_chunk_size: int,
+) -> None:
+    args = parse_args(
+        [
+            "--repo-id",
+            "local-model",
+            "--dataset-name",
+            "local-data",
+            "--max-sequence-length",
+            str(max_sequence_length),
+            *training_mode_args,
+            "--mlp-chunk-size",
+            str(mlp_chunk_size),
+        ]
+    )
+    assert args.mlp_chunk_size == mlp_chunk_size
+
+
+@pytest.mark.parametrize(
+    ("training_mode_args", "expected"),
+    [
+        ([], True),
+        (["--lora", "True"], False),
+        (
+            ["--lora", "True", "--lora-train-embed-and-lm-head", "True"],
+            False,
+        ),
+    ],
+    ids=["full", "lora", "lora_with_embed_and_head"],
+)
+def test_layer_scan_automatic_selection_is_limited_to_verified_full_long_context(
+    training_mode_args: list[str],
+    expected: bool,
+) -> None:
+    args = parse_args(
+        [
+            "--repo-id",
+            "local-model",
+            "--dataset-name",
+            "local-data",
+            "--max-sequence-length",
+            "524288",
+            *training_mode_args,
+        ]
+    )
+    assert args.scan_layers is expected
+
+    below_threshold = parse_args(
+        [
+            "--repo-id",
+            "local-model",
+            "--dataset-name",
+            "local-data",
+            "--max-sequence-length",
+            "524287",
+            *training_mode_args,
+        ]
+    )
+    assert below_threshold.scan_layers is False
+
+
+def test_explicit_layer_scan_overrides_automatic_selection() -> None:
+    enabled = parse_args(
+        [
+            "--repo-id",
+            "local-model",
+            "--dataset-name",
+            "local-data",
+            "--max-sequence-length",
+            "8192",
+            "--scan-layers",
+        ]
+    )
+    disabled = parse_args(
+        [
+            "--repo-id",
+            "local-model",
+            "--dataset-name",
+            "local-data",
+            "--max-sequence-length",
+            "524288",
+            "--no-scan-layers",
+        ]
+    )
+    lora_enabled = parse_args(
+        [
+            "--repo-id",
+            "local-model",
+            "--dataset-name",
+            "local-data",
+            "--max-sequence-length",
+            "8192",
+            "--lora",
+            "True",
+            "--scan-layers",
+        ]
+    )
+    assert enabled.scan_layers is True
+    assert disabled.scan_layers is False
+    assert lora_enabled.scan_layers is True
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ["--mlp-chunk-size", "1024"],
+        ["--gradient-checkpointing", "disabled"],
+    ],
+    ids=["nested_mlp_scan", "checkpointing_disabled"],
+)
+def test_layer_scan_auto_requires_the_verified_remat_and_untiled_mlp(
+    extra_args: list[str],
+) -> None:
+    args = parse_args(
+        [
+            "--repo-id",
+            "local-model",
+            "--dataset-name",
+            "local-data",
+            "--max-sequence-length",
+            "524288",
+            *extra_args,
+        ]
+    )
+    assert args.scan_layers is False
+
+
+def test_automatic_attention_block_sizes_follow_context_threshold() -> None:
+    expected_by_context = {
+        131071: 128,
+        131072: 256,
+        262143: 256,
+        262144: 512,
+        524287: 512,
+        524288: 1024,
+    }
+    for max_sequence_length, expected in expected_by_context.items():
+        args = parse_args(
+            [
+                "--repo-id",
+                "local-model",
+                "--dataset-name",
+                "local-data",
+                "--max-sequence-length",
+                str(max_sequence_length),
+            ]
+        )
+        assert (args.block_size_q, args.block_size_k) == (expected, expected)
+
+
+def test_explicit_attention_block_sizes_override_automatic_selection_independently(
+) -> None:
+    args = parse_args(
+        [
+            "--repo-id",
+            "local-model",
+            "--dataset-name",
+            "local-data",
+            "--max-sequence-length",
+            "131072",
+            "--block-size-q",
+            "64",
+            "--block-size-k",
+            "512",
+        ]
+    )
+    assert args.block_size_q == 64
+    assert args.block_size_k == 512
+
+    q_only = parse_args(
+        [
+            "--repo-id",
+            "local-model",
+            "--dataset-name",
+            "local-data",
+            "--max-sequence-length",
+            "131072",
+            "--block-size-q",
+            "64",
+        ]
+    )
+    assert (q_only.block_size_q, q_only.block_size_k) == (64, 256)
+
+    k_only = parse_args(
+        [
+            "--repo-id",
+            "local-model",
+            "--dataset-name",
+            "local-data",
+            "--max-sequence-length",
+            "131072",
+            "--block-size-k",
+            "512",
+        ]
+    )
+    assert (k_only.block_size_q, k_only.block_size_k) == (256, 512)
+
+
+@pytest.mark.parametrize(
+    "option",
+    ["--mlp-chunk-size", "--block-size-q", "--block-size-k"],
+)
+def test_automatic_tuning_arguments_still_reject_negative_explicit_values(
+    option: str,
+) -> None:
+    with pytest.raises(ValueError):
+        parse_args(
+            [
+                "--repo-id",
+                "local-model",
+                "--dataset-name",
+                "local-data",
+                option,
+                "-1",
+            ]
+        )
+
+
+def test_automatic_tuning_help_describes_context_and_mode_selection() -> None:
+    help_text = " ".join(build_parser().format_help().split())
+    assert "use 128 below 131072 tokens, 256 below 262144" in help_text
+    assert "512 below 524288, and 1024 otherwise" in help_text
+    assert "uses 1024 only for contexts from 4096 through 131071 tokens" in help_text
+    assert "LoRA and sequence-parallel training disable it automatically" in help_text
+    assert "full training at contexts of at least 524288 tokens" in help_text
+
+
+def test_replicated_preprocessing_remains_available() -> None:
+    args = parse_args(
+        [
+            "--repo-id",
+            "local-model",
+            "--dataset-name",
+            "local-data",
+            "--preprocessing-mode",
+            "replicated",
+        ]
+    )
+    assert args.preprocessing_mode == "replicated"
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [("--save-optimizer-state", None), ("--save_optimizer_state", "True")],
+)
+def test_cli_accepts_save_optimizer_state(option: str, value: str | None) -> None:
+    command = ["--repo-id", "local-model", "--dataset-name", "local-data", option]
+    if value is not None:
+        command.append(value)
+    args = parse_args(command)
+    assert args.save_optimizer_state is True
+
+
+def test_cli_accepts_lora_reference_options() -> None:
+    args = parse_args(
+        [
+            "--repo-id",
+            "local-model",
+            "--dataset-name",
+            "local-data",
+            "--lora",
+            "True",
+            "--lora-rank",
+            "256",
+            "--frozen_parameters",
+            "lm_head|embed|norm",
+        ]
+    )
+    assert args.lora is True
+    assert args.lora_rank == 256
+    assert args.frozen_parameters == "lm_head|embed|norm"
+
+
+def test_cli_enables_embedding_and_head_training_for_lora() -> None:
+    args = parse_args(
+        [
+            "--repo-id",
+            "local-model",
+            "--dataset-name",
+            "local-data",
+            "--lora",
+            "True",
+            "--lora-train-embed-and-lm-head",
+            "True",
+        ]
+    )
+    assert args.lora_train_embed_and_lm_head is True
+
+
+def test_embedding_and_head_training_requires_lora() -> None:
+    with pytest.raises(ValueError, match="requires --lora True"):
+        parse_args(
+            [
+                "--repo-id",
+                "local-model",
+                "--dataset-name",
+                "local-data",
+                "--lora-train-embed-and-lm-head",
+                "True",
+            ]
+        )
+
+
+def test_endprompt_is_allowed_with_packing_and_resolves_logical_lengths() -> None:
+    args = parse_args(
+        [
+            "--repo-id",
+            "local-model",
+            "--dataset-name",
+            "local-data",
+            "--packing",
+            "True",
+            "--max-sequence-length",
+            "4096",
+            "--endprompt-enable",
+            "True",
+            "--endprompt-logical-length",
+            "8192",
+            "--endprompt-logical-length-min",
+            "4096",
+            "--endprompt-prompts",
+            "first||second",
+        ]
+    )
+    assert args.packing is True
+    assert args.endprompt_enable is True
+    assert args.effective_endprompt_logical_length == 8192
+    assert args.effective_endprompt_logical_length_min == 4096
+    assert args.endprompt_prompt_texts == ("first", "second")
+
+
+def test_endprompt_allows_messages_assistant_only_and_packing() -> None:
+    args = parse_args(
+        [
+            "--repo-id",
+            "local-model",
+            "--dataset-name",
+            "local-data",
+            "--dataset-text-field",
+            "messages",
+            "--assistant-only-loss",
+            "True",
+            "--packing",
+            "True",
+            "--endprompt-enable",
+            "True",
+            "--lora",
+            "True",
+            "--lora-train-embed-and-lm-head",
+            "True",
+            "--lora-save-adapter-only",
+            "True",
+        ]
+    )
+    assert args.assistant_only_loss is True
+    assert args.endprompt_enable is True
+    assert args.packing is True
+    assert args.lora_train_embed_and_lm_head is True
+    assert args.lora_save_adapter_only is True
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("--endprompt-logical-length", "0"),
+        ("--endprompt-logical-length", "-1"),
+        ("--endprompt-logical-length-min", "0"),
+    ],
+)
+def test_endprompt_rejects_non_positive_logical_lengths(option: str, value: str) -> None:
+    with pytest.raises(ValueError, match="logical lengths"):
+        parse_args(
+            [
+                "--repo-id",
+                "local-model",
+                "--dataset-name",
+                "local-data",
+                "--endprompt-enable",
+                "True",
+                option,
+                value,
+            ]
+        )
+
+
+def test_adapter_only_requires_and_accepts_lora() -> None:
+    with pytest.raises(ValueError, match="requires --lora True"):
+        parse_args(
+            [
+                "--repo-id",
+                "local-model",
+                "--dataset-name",
+                "local-data",
+                "--lora-save-adapter-only",
+                "True",
+            ]
+        )
+    args = parse_args(
+        [
+            "--repo-id",
+            "local-model",
+            "--dataset-name",
+            "local-data",
+            "--lora",
+            "True",
+            "--lora-save-adapter-only",
+            "True",
+        ]
+    )
+    assert args.lora_save_adapter_only is True
+
+
+def test_lora_optimizer_checkpointing_requires_adapter_only_output() -> None:
+    with pytest.raises(ValueError, match="lora_save_adapter_only True"):
+        parse_args(
+            [
+                "--repo-id",
+                "local-model",
+                "--dataset-name",
+                "local-data",
+                "--lora",
+                "True",
+                "--save-optimizer-state",
+                "True",
+            ]
+        )
+
+
+def test_adapter_only_lora_accepts_optimizer_checkpointing() -> None:
+    args = parse_args(
+        [
+            "--repo-id",
+            "local-model",
+            "--dataset-name",
+            "local-data",
+            "--lora",
+            "True",
+            "--lora-save-adapter-only",
+            "True",
+            "--save-optimizer-state",
+            "True",
+        ]
+    )
+    assert args.save_optimizer_state is True
+
+
+def test_frozen_parameters_is_not_silently_applied_to_full_training() -> None:
+    with pytest.raises(ValueError, match="only with --lora"):
+        parse_args(
+            [
+                "--repo-id",
+                "local-model",
+                "--dataset-name",
+                "local-data",
+                "--frozen-parameters",
+                "norm",
+            ]
+        )
