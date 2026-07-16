@@ -299,7 +299,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add(parser, "total_batch_size", type=int, default=32, help="Global micro-batch size.")
     _add(parser, "gradient_accumulation_steps", type=int, default=1)
     _add(parser, "learning_rate", type=float, default=2e-5)
-    _add(parser, "learning_rate_end", type=float, default=5e-6)
+    _add(parser, "learning_rate_end", type=float, default=0.0)
     _add(parser, "scheduler", choices=("cosine", "linear", "constant"), default="cosine")
     _add(parser, "warmup_steps", type=int, default=0)
     _add(parser, "weight_decay", type=float, default=0.0)

@@ -137,6 +137,7 @@ def test_cli_accepts_bare_boolean_and_hyphenated_names() -> None:
 def test_save_optimizer_state_defaults_to_false() -> None:
     args = parse_args(["--repo-id", "local-model", "--dataset-name", "local-data"])
     assert args.save_optimizer_state is False
+    assert args.learning_rate_end == 0.0
     assert args.endprompt_enable is False
     assert args.lora_train_embed_and_lm_head is False
     assert args.preprocessing_mode == "shard_then_merge"
