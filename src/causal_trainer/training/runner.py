@@ -8,6 +8,8 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
+from tqdm.auto import tqdm
+
 from ..checkpointing.bundles import ResumeCheckpoint
 from .arguments import TrainingArguments, parse_args
 
@@ -727,6 +729,8 @@ def main(argv: list[str] | None = None) -> None:
     )
     resume_checkpoint = None
     discovery_error = None
+    discovery_started_at = time.monotonic()
+    logger.info("checking %s for a resumable checkpoint", args.output_dir)
     try:
         resume_checkpoint = find_latest_checkpoint(
             args.output_dir,
@@ -744,6 +748,11 @@ def main(argv: list[str] | None = None) -> None:
     except Exception as exc:
         discovery_error = exc
     _raise_if_any_process_error("discovering a resume checkpoint", discovery_error)
+    logger.info(
+        "checkpoint discovery complete in %.1fs (%s)",
+        time.monotonic() - discovery_started_at,
+        "checkpoint found" if resume_checkpoint is not None else "starting fresh",
+    )
     start_step = resume_checkpoint.global_step if resume_checkpoint is not None else 0
     if jax.process_count() > 1:
         from jax.experimental import multihost_utils
@@ -806,6 +815,8 @@ def main(argv: list[str] | None = None) -> None:
         )
         params = None
         parameter_load_error = None
+        parameter_load_started_at = time.monotonic()
+        logger.info("loading and sharding model parameters from %s", parameter_source)
         try:
             params = load_sharded_parameters(
                 parameter_source,
@@ -824,6 +835,10 @@ def main(argv: list[str] | None = None) -> None:
         _raise_if_any_process_error("loading model parameters", parameter_load_error)
         if params is None:
             raise RuntimeError("model parameter loading failed without a reported error")
+        logger.info(
+            "model parameters ready in %.1fs",
+            time.monotonic() - parameter_load_started_at,
+        )
         base_param_shardings = jax.tree.map(lambda value: value.sharding, params)
         lora_params = None
         if args.lora:
@@ -923,6 +938,14 @@ def main(argv: list[str] | None = None) -> None:
             and resume_checkpoint.has_optimizer_state
             and (start_step < plan.total_steps or args.save_optimizer_state)
         )
+        optimizer_action = (
+            "restoring optimizer state"
+            if should_restore_optimizer
+            else ("initializing AdamW state" if start_step < plan.total_steps else None)
+        )
+        optimizer_started_at = time.monotonic()
+        if optimizer_action is not None:
+            logger.info("%s", optimizer_action)
         if should_restore_optimizer:
             optimizer_state = None
             optimizer_load_error = None
@@ -950,6 +973,12 @@ def main(argv: list[str] | None = None) -> None:
                 optimizer,
                 trainable_params,
                 optimizer_state_shardings,
+            )
+        if optimizer_action is not None:
+            logger.info(
+                "%s complete in %.1fs",
+                optimizer_action,
+                time.monotonic() - optimizer_started_at,
             )
         common_step_options = {
             "attention_implementation": args.attn_mechanism,
@@ -1092,7 +1121,7 @@ def main(argv: list[str] | None = None) -> None:
     global_batch = None
     device_metrics = None
 
-    def log_device_metrics(metric_step: int, synchronized_metrics: Any) -> None:
+    def log_device_metrics(metric_step: int, synchronized_metrics: Any) -> dict[str, float]:
         metrics = {
             key: float(np.asarray(jax.device_get(value)))
             for key, value in synchronized_metrics.items()
@@ -1121,60 +1150,103 @@ def main(argv: list[str] | None = None) -> None:
                 f"logging training metrics at step {metric_step}",
                 primary_logging_error,
             )
+        return metrics
 
-    for zero_based_step, global_batch in enumerate(batches, start=start_step):
-        step = zero_based_step + 1
-        with jax.set_mesh(mesh):
-            if args.lora:
-                if lora_params is None:
-                    raise RuntimeError("LoRA parameters are unavailable")
-                lora_params, optimizer_state, device_metrics = train_step(
-                    params,
-                    lora_params,
-                    optimizer_state,
-                    global_batch,
-                    jnp.asarray(zero_based_step, jnp.int32),
+    progress_bar = None
+    first_update_started_at = time.monotonic()
+    if start_step < plan.total_steps:
+        logger.info(
+            "compiling and executing the first training step; a cold TPU compile can take several minutes"
+        )
+    try:
+        for zero_based_step, global_batch in enumerate(batches, start=start_step):
+            step = zero_based_step + 1
+            with jax.set_mesh(mesh):
+                if args.lora:
+                    if lora_params is None:
+                        raise RuntimeError("LoRA parameters are unavailable")
+                    lora_params, optimizer_state, device_metrics = train_step(
+                        params,
+                        lora_params,
+                        optimizer_state,
+                        global_batch,
+                        jnp.asarray(zero_based_step, jnp.int32),
+                    )
+                else:
+                    params, optimizer_state, device_metrics = train_step(
+                        params,
+                        optimizer_state,
+                        global_batch,
+                        jnp.asarray(zero_based_step, jnp.int32),
+                    )
+            pending_metrics.append((step, device_metrics))
+            _enforce_metric_window(jax, pending_metrics, args.async_dispatch_steps)
+            completed_steps = step
+            if progress_bar is not None:
+                progress_bar.update(1)
+
+            if step % args.logging_steps == 0 or step == start_step + 1:
+                synchronized = _synchronize_metric_window(jax, pending_metrics)
+                if synchronized is None or synchronized[0] != step:
+                    raise RuntimeError("the metric synchronization window lost the current training step")
+                metrics = log_device_metrics(step, synchronized[1])
+                last_logged_step = step
+                if step == start_step + 1:
+                    logger.info(
+                        "first training step complete in %.1fs (includes tracing, compilation, and execution)",
+                        time.monotonic() - first_update_started_at,
+                    )
+                    if is_primary:
+                        # Start timing only after the cold compile so tqdm's rate and ETA
+                        # describe steady training instead of compilation latency.
+                        progress_bar = tqdm(
+                            total=plan.total_steps,
+                            initial=step,
+                            desc="Training",
+                            unit="step",
+                            dynamic_ncols=True,
+                            mininterval=1.0,
+                        )
+                if progress_bar is not None:
+                    progress_bar.set_postfix(
+                        loss=f"{metrics['loss']:.4f}",
+                        lr=f"{metrics['learning_rate']:.2e}",
+                        grad=f"{metrics['grad_norm']:.3f}",
+                        refresh=True,
+                    )
+
+            if args.save_steps > 0 and step % args.save_steps == 0 and step < plan.total_steps:
+                _synchronize_metric_window(jax, pending_metrics)
+                # The current batch is no longer needed. Release its device arrays
+                # before checkpoint collectives request their bounded transfer
+                # buffers; the prefetch queue remains independently bounded.
+                global_batch = None
+                device_metrics = None
+                checkpoint_dir = args.output_dir / f"checkpoint-{step}"
+                save_current_checkpoint(checkpoint_dir, step)
+                prune_error = None
+                if is_primary:
+                    try:
+                        prune_periodic_exports(args.output_dir, args.save_total_limit)
+                    except Exception as exc:
+                        prune_error = exc
+                _raise_if_process_zero_error("pruning periodic checkpoints", prune_error)
+                sync_processes(f"periodic-prune-{step}")
+
+        final_metrics = _synchronize_metric_window(jax, pending_metrics)
+        if final_metrics is not None and final_metrics[0] != last_logged_step:
+            metrics = log_device_metrics(final_metrics[0], final_metrics[1])
+            last_logged_step = final_metrics[0]
+            if progress_bar is not None:
+                progress_bar.set_postfix(
+                    loss=f"{metrics['loss']:.4f}",
+                    lr=f"{metrics['learning_rate']:.2e}",
+                    grad=f"{metrics['grad_norm']:.3f}",
+                    refresh=True,
                 )
-            else:
-                params, optimizer_state, device_metrics = train_step(
-                    params,
-                    optimizer_state,
-                    global_batch,
-                    jnp.asarray(zero_based_step, jnp.int32),
-                )
-        pending_metrics.append((step, device_metrics))
-        _enforce_metric_window(jax, pending_metrics, args.async_dispatch_steps)
-        completed_steps = step
-
-        if step % args.logging_steps == 0 or step == start_step + 1:
-            synchronized = _synchronize_metric_window(jax, pending_metrics)
-            if synchronized is None or synchronized[0] != step:
-                raise RuntimeError("the metric synchronization window lost the current training step")
-            log_device_metrics(step, synchronized[1])
-            last_logged_step = step
-
-        if args.save_steps > 0 and step % args.save_steps == 0 and step < plan.total_steps:
-            _synchronize_metric_window(jax, pending_metrics)
-            # The current batch is no longer needed. Release its device arrays
-            # before checkpoint collectives request their bounded transfer
-            # buffers; the prefetch queue remains independently bounded.
-            global_batch = None
-            device_metrics = None
-            checkpoint_dir = args.output_dir / f"checkpoint-{step}"
-            save_current_checkpoint(checkpoint_dir, step)
-            prune_error = None
-            if is_primary:
-                try:
-                    prune_periodic_exports(args.output_dir, args.save_total_limit)
-                except Exception as exc:
-                    prune_error = exc
-            _raise_if_process_zero_error("pruning periodic checkpoints", prune_error)
-            sync_processes(f"periodic-prune-{step}")
-
-    final_metrics = _synchronize_metric_window(jax, pending_metrics)
-    if final_metrics is not None and final_metrics[0] != last_logged_step:
-        log_device_metrics(final_metrics[0], final_metrics[1])
-        last_logged_step = final_metrics[0]
+    finally:
+        if progress_bar is not None:
+            progress_bar.close()
     global_batch = None
     device_metrics = None
     logger.info(
