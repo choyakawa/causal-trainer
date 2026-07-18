@@ -9,6 +9,7 @@ import optax
 from ..distributed.runtime import path_to_string
 from ..modeling.architecture import decoder_forward
 from ..modeling.config import ModelConfig
+from ..modeling.freezing import compose_full_trainable_params
 from .losses import chunked_causal_lm_loss
 
 
@@ -142,6 +143,161 @@ def make_train_step(
         ),
         out_shardings=(param_shardings, optimizer_state_shardings, metric_shardings),
         donate_argnums=(0, 1),
+    )
+
+
+def make_frozen_full_train_step(
+    config: ModelConfig,
+    mesh,
+    optimizer: optax.GradientTransformation,
+    learning_rate_schedule: Callable[[jax.Array], jax.Array],
+    *,
+    attention_implementation: str,
+    gradient_accumulation_steps: int,
+    remat_policy: str,
+    compute_dtype,
+    block_q: int,
+    block_k: int,
+    loss_token_budget: int,
+    loss_implementation: str,
+    mlp_chunk_size: int,
+    sparse_loss_skip: bool,
+    frozen_param_shardings,
+    trainable_param_shardings,
+    optimizer_state_shardings,
+    batch_named_sharding,
+    replicated_named_sharding,
+    lm_head_trainable: bool,
+    gather_kv_projection_weights: bool = False,
+    scan_layers: bool = False,
+):
+    """Build a full-rank step that excludes frozen leaves from autodiff and AdamW."""
+
+    if gradient_accumulation_steps <= 0:
+        raise ValueError("gradient_accumulation_steps must be positive")
+
+    def one_microbatch(frozen_params, trainable_params, batch):
+        forward_params = compose_full_trainable_params(frozen_params, trainable_params)
+        hidden_states = decoder_forward(
+            forward_params,
+            config,
+            batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            position_ids=batch["position_ids"],
+            segment_ids=batch["segment_ids"],
+            implementation=attention_implementation,
+            mesh=mesh,
+            deterministic=True,
+            remat_policy=remat_policy,
+            compute_dtype=compute_dtype,
+            block_q=block_q,
+            block_k=block_k,
+            mlp_chunk_size=mlp_chunk_size,
+            gather_kv_projection_weights=gather_kv_projection_weights,
+            scan_layers=scan_layers,
+        )
+        return chunked_causal_lm_loss(
+            hidden_states,
+            forward_params["lm_head"]["kernel"],
+            batch["input_ids"],
+            batch["attention_mask"],
+            segment_ids=batch["segment_ids"],
+            loss_weights=batch["loss_weights"],
+            token_budget=loss_token_budget,
+            compute_dtype=compute_dtype,
+            loss_implementation=loss_implementation,
+            mesh=mesh,
+            sparse_skip=sparse_loss_skip,
+            lm_head_trainable=lm_head_trainable,
+        )
+
+    def train_step(frozen_params, trainable_params, optimizer_state, batch, step):
+        full_batch = batch["input_ids"].shape[0]
+        if full_batch % gradient_accumulation_steps:
+            raise ValueError("effective global batch is not divisible by gradient_accumulation_steps")
+        micro_batch_size = full_batch // gradient_accumulation_steps
+        if gradient_accumulation_steps == 1:
+            (nll_and_tokens, gradient_sums) = jax.value_and_grad(
+                one_microbatch,
+                argnums=1,
+                has_aux=True,
+            )(frozen_params, trainable_params, batch)
+            nll_sum, token_count = nll_and_tokens
+        else:
+            float_grads = jax.tree.map(
+                lambda value: jnp.zeros(value.shape, jnp.float32),
+                trainable_params,
+            )
+
+            def accumulate(carry, micro_index):
+                accumulated_grads, accumulated_nll, accumulated_tokens = carry
+                start = micro_index * micro_batch_size
+                micro = jax.tree.map(
+                    lambda value: jax.lax.dynamic_slice_in_dim(value, start, micro_batch_size, axis=0),
+                    batch,
+                )
+                (nll_and_tokens, grads) = jax.value_and_grad(
+                    one_microbatch,
+                    argnums=1,
+                    has_aux=True,
+                )(frozen_params, trainable_params, micro)
+                micro_nll, micro_tokens = nll_and_tokens
+                grads = jax.tree.map(lambda grad: grad.astype(jnp.float32), grads)
+                accumulated_grads = jax.tree.map(jnp.add, accumulated_grads, grads)
+                return (
+                    accumulated_grads,
+                    accumulated_nll + micro_nll,
+                    accumulated_tokens + micro_tokens,
+                ), None
+
+            (gradient_sums, nll_sum, token_count), _ = jax.lax.scan(
+                accumulate,
+                (float_grads, jnp.asarray(0.0, jnp.float32), jnp.asarray(0.0, jnp.float32)),
+                jnp.arange(gradient_accumulation_steps, dtype=jnp.int32),
+            )
+        denominator = jnp.maximum(token_count, 1.0)
+        grads = jax.tree.map(
+            lambda gradient, parameter: (gradient / denominator).astype(parameter.dtype),
+            gradient_sums,
+            trainable_params,
+        )
+        grad_norm = optax.global_norm(grads)
+        updates, optimizer_state = optimizer.update(grads, optimizer_state, trainable_params)
+        updates = jax.tree.map(
+            lambda update, parameter: update.astype(parameter.dtype),
+            updates,
+            trainable_params,
+        )
+        updated = optax.apply_updates(trainable_params, updates)
+        trainable_params = jax.tree.map(
+            lambda new, old: new.astype(old.dtype),
+            updated,
+            trainable_params,
+        )
+        metrics = {
+            "loss": nll_sum / denominator,
+            "nll_sum": nll_sum,
+            "token_count": token_count,
+            "grad_norm": grad_norm,
+            "learning_rate": learning_rate_schedule(step),
+        }
+        return trainable_params, optimizer_state, metrics
+
+    metric_shardings = {
+        key: replicated_named_sharding
+        for key in ("loss", "nll_sum", "token_count", "grad_norm", "learning_rate")
+    }
+    return jax.jit(
+        train_step,
+        in_shardings=(
+            frozen_param_shardings,
+            trainable_param_shardings,
+            optimizer_state_shardings,
+            batch_named_sharding,
+            replicated_named_sharding,
+        ),
+        out_shardings=(trainable_param_shardings, optimizer_state_shardings, metric_shardings),
+        donate_argnums=(1, 2),
     )
 
 
@@ -355,6 +511,7 @@ def initialize_optimizer(optimizer: optax.GradientTransformation, params, shardi
 __all__ = [
     "infer_optimizer_state_shardings",
     "initialize_optimizer",
+    "make_frozen_full_train_step",
     "make_lora_train_step",
     "make_train_step",
     "optimizer_state_template",

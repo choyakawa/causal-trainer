@@ -47,3 +47,24 @@ def test_resolved_layer_scan_is_part_of_distributed_and_resume_identity() -> Non
         prepared_dummy_rows=0,
     )
     assert payload["arguments"]["scan_layers"] is True
+
+
+def test_full_parameter_freezing_is_part_of_distributed_and_resume_identity() -> None:
+    unfrozen = parse_args(
+        ["--repo-id", "local-model", "--dataset-name", "local-data"]
+    )
+    frozen = replace(unfrozen, frozen_parameters="lm_head|embed|norm")
+
+    assert _distributed_arguments_digest(unfrozen) != _distributed_arguments_digest(frozen)
+
+    payload = _resume_signature_payload(
+        frozen,
+        _Config(),
+        _Plan(),
+        SimpleNamespace(_fingerprint="synthetic"),
+        SimpleNamespace(shape={"dp": 1, "fsdp": 1, "ep": 1, "tp": 8, "sp": 4}),
+        preprocessing_process_count=8,
+        prepared_real_rows=1,
+        prepared_dummy_rows=0,
+    )
+    assert payload["arguments"]["frozen_parameters"] == "lm_head|embed|norm"

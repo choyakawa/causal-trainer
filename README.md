@@ -129,6 +129,14 @@ Source rows are divided among JAX processes, preprocessed locally, and merged ov
 
 Full-parameter training is the default. The base parameters and AdamW state use the configured parameter dtype, while numerically sensitive normalization, softmax, loss-reduction, and gradient-scratch operations use FP32 where required.
 
+To keep the token embedding, language-model head, and every normalization scale frozen while training the remaining full-rank parameters:
+
+```text
+--frozen_parameters "lm_head|embed|norm"
+```
+
+Supported components are `lm_head`, `embed`, and `norm`; separate multiple components with `|` or `,`. The `norm` component includes the final normalization and both normalization scales in every decoder layer. When omitted, no full-rank parameters are frozen.
+
 The default precision options are:
 
 ```text

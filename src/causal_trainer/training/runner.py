@@ -432,6 +432,10 @@ def main(argv: list[str] | None = None) -> None:
     )
     from ..modeling.architecture import parameter_shapes
     from ..modeling.config import ModelConfig
+    from ..modeling.freezing import (
+        compose_full_trainable_params,
+        split_full_trainable_params,
+    )
     from ..modeling.lora import (
         compose_lora_export_params,
         init_lora_params,
@@ -449,6 +453,7 @@ def main(argv: list[str] | None = None) -> None:
     from .steps import (
         infer_optimizer_state_shardings,
         initialize_optimizer,
+        make_frozen_full_train_step,
         make_lora_train_step,
         make_train_step,
         optimizer_state_template,
@@ -471,7 +476,12 @@ def main(argv: list[str] | None = None) -> None:
     logger = configure_logging(is_primary)
     mesh = create_mesh(args.sharding_axis, dcn_axis_dims=args.sharding_dcn_axis)
     logger.info("JAX backend=%s global_devices=%d mesh=%s", jax.default_backend(), jax.device_count(), mesh.shape)
-    trainable_lm_head = not args.lora or args.lora_train_embed_and_lm_head
+    full_frozen_components = () if args.lora else args.frozen_parameter_components
+    trainable_lm_head = (
+        args.lora_train_embed_and_lm_head
+        if args.lora
+        else "lm_head" not in full_frozen_components
+    )
     cut_mesh_supported = all(
         int(mesh.shape.get(axis, 1)) == 1 for axis in ("fsdp", "ep")
     )
@@ -699,7 +709,15 @@ def main(argv: list[str] | None = None) -> None:
         (
             "lora+embed+head"
             if args.lora and args.lora_train_embed_and_lm_head
-            else ("lora" if args.lora else "full")
+            else (
+                "lora"
+                if args.lora
+                else (
+                    "full-frozen-" + "+".join(full_frozen_components)
+                    if full_frozen_components
+                    else "full"
+                )
+            )
         ),
     )
     if args.lora and args.frozen_parameters:
@@ -841,6 +859,7 @@ def main(argv: list[str] | None = None) -> None:
         )
         base_param_shardings = jax.tree.map(lambda value: value.sharding, params)
         lora_params = None
+        full_trainable_params = None
         if args.lora:
             if lora_template is None:
                 raise RuntimeError("LoRA parameter template was not created")
@@ -905,6 +924,16 @@ def main(argv: list[str] | None = None) -> None:
                     train_embed_and_lm_head=args.lora_train_embed_and_lm_head,
                 )
             trainable_params = lora_params
+        elif full_frozen_components:
+            params, full_trainable_params = split_full_trainable_params(
+                params,
+                full_frozen_components,
+            )
+            base_param_shardings, trainable_param_shardings = split_full_trainable_params(
+                base_param_shardings,
+                full_frozen_components,
+            )
+            trainable_params = full_trainable_params
         else:
             trainable_params = params
             trainable_param_shardings = base_param_shardings
@@ -1009,6 +1038,17 @@ def main(argv: list[str] | None = None) -> None:
                 train_embed_and_lm_head=args.lora_train_embed_and_lm_head,
                 **common_step_options,
             )
+        elif full_frozen_components:
+            train_step = make_frozen_full_train_step(
+                config,
+                mesh,
+                optimizer,
+                schedule,
+                frozen_param_shardings=base_param_shardings,
+                trainable_param_shardings=trainable_param_shardings,
+                lm_head_trainable=trainable_lm_head,
+                **common_step_options,
+            )
         else:
             train_step = make_train_step(
                 config,
@@ -1067,12 +1107,14 @@ def main(argv: list[str] | None = None) -> None:
             )
             return
 
+        if lora_params is not None:
+            checkpoint_params = compose_lora_export_params(params, lora_params)
+        elif full_trainable_params is not None:
+            checkpoint_params = compose_full_trainable_params(params, full_trainable_params)
+        else:
+            checkpoint_params = params
         save_checkpoint_bundle(
-            (
-                compose_lora_export_params(params, lora_params)
-                if lora_params is not None
-                else params
-            ),
+            checkpoint_params,
             optimizer_state,
             destination,
             step=step,
@@ -1168,6 +1210,16 @@ def main(argv: list[str] | None = None) -> None:
                     lora_params, optimizer_state, device_metrics = train_step(
                         params,
                         lora_params,
+                        optimizer_state,
+                        global_batch,
+                        jnp.asarray(zero_based_step, jnp.int32),
+                    )
+                elif full_frozen_components:
+                    if full_trainable_params is None:
+                        raise RuntimeError("full-parameter trainables are unavailable")
+                    full_trainable_params, optimizer_state, device_metrics = train_step(
+                        params,
+                        full_trainable_params,
                         optimizer_state,
                         global_batch,
                         jnp.asarray(zero_based_step, jnp.int32),

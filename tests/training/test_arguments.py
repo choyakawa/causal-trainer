@@ -139,6 +139,8 @@ def test_save_optimizer_state_defaults_to_false() -> None:
     assert args.save_optimizer_state is False
     assert args.learning_rate_end == 0.0
     assert args.endprompt_enable is False
+    assert args.frozen_parameters is None
+    assert args.frozen_parameter_components == ()
     assert args.lora_train_embed_and_lm_head is False
     assert args.preprocessing_mode == "shard_then_merge"
     assert args.sharding_axis == "-1,1,1,4,1"
@@ -519,6 +521,49 @@ def test_cli_enables_embedding_and_head_training_for_lora() -> None:
     assert args.lora_train_embed_and_lm_head is True
 
 
+@pytest.mark.parametrize(
+    ("value", "expected_components", "canonical"),
+    [
+        ("lm_head", ("lm_head",), "lm_head"),
+        ("embed,norm", ("embed", "norm"), "embed|norm"),
+        ("norm|lm_head|embed", ("lm_head", "embed", "norm"), "lm_head|embed|norm"),
+    ],
+)
+def test_cli_selects_full_parameter_components_to_freeze(
+    value: str,
+    expected_components: tuple[str, ...],
+    canonical: str,
+) -> None:
+    args = parse_args(
+        [
+            "--repo-id",
+            "local-model",
+            "--dataset-name",
+            "local-data",
+            "--frozen-parameters",
+            value,
+        ]
+    )
+
+    assert args.frozen_parameter_components == expected_components
+    assert args.frozen_parameters == canonical
+
+
+@pytest.mark.parametrize("value", ["attention", "|"])
+def test_cli_rejects_unsupported_or_empty_frozen_components(value: str) -> None:
+    with pytest.raises(ValueError, match="frozen_parameters"):
+        parse_args(
+            [
+                "--repo-id",
+                "local-model",
+                "--dataset-name",
+                "local-data",
+                "--frozen-parameters",
+                value,
+            ]
+        )
+
+
 def test_embedding_and_head_training_requires_lora() -> None:
     with pytest.raises(ValueError, match="requires --lora True"):
         parse_args(
@@ -674,17 +719,4 @@ def test_adapter_only_lora_accepts_optimizer_checkpointing() -> None:
         ]
     )
     assert args.save_optimizer_state is True
-
-
-def test_frozen_parameters_is_not_silently_applied_to_full_training() -> None:
-    with pytest.raises(ValueError, match="only with --lora"):
-        parse_args(
-            [
-                "--repo-id",
-                "local-model",
-                "--dataset-name",
-                "local-data",
-                "--frozen-parameters",
-                "norm",
-            ]
-        )
+    assert args.lora_save_adapter_only is True

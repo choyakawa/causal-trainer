@@ -7,6 +7,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+_FROZEN_PARAMETER_COMPONENTS = ("lm_head", "embed", "norm")
+
+
 def parse_bool(value: str | bool) -> bool:
     if isinstance(value, bool):
         return value
@@ -16,6 +19,21 @@ def parse_bool(value: str | bool) -> bool:
     if normalized in {"0", "false", "no", "n", "off"}:
         return False
     raise argparse.ArgumentTypeError(f"expected a boolean value, got {value!r}")
+
+
+def parse_frozen_parameter_components(value: str | None) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    requested = {component.strip() for component in value.replace(",", "|").split("|")}
+    requested.discard("")
+    if not requested:
+        raise ValueError("frozen_parameters must name at least one component")
+    unsupported = requested - set(_FROZEN_PARAMETER_COMPONENTS)
+    if unsupported:
+        raise ValueError(
+            "unsupported frozen_parameters components: " + ", ".join(sorted(unsupported))
+        )
+    return tuple(component for component in _FROZEN_PARAMETER_COMPONENTS if component in requested)
 
 
 def _flags(name: str) -> tuple[str, ...]:
@@ -127,6 +145,10 @@ class TrainingArguments:
     @property
     def endprompt_prompt_texts(self) -> tuple[str, ...]:
         return tuple(prompt for prompt in self.endprompt_prompts.split("||") if prompt)
+
+    @property
+    def frozen_parameter_components(self) -> tuple[str, ...]:
+        return parse_frozen_parameter_components(self.frozen_parameters)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -341,8 +363,9 @@ def build_parser() -> argparse.ArgumentParser:
         "frozen_parameters",
         default=None,
         help=(
-            "Accepted for LoRA command compatibility. Parameter selection is controlled by --lora and "
-            "--lora-train-embed-and-lm-head."
+            "Pipe- or comma-separated components to freeze during full-rank training. Supported components "
+            "are lm_head, embed, and norm. In LoRA mode this is accepted for command compatibility because "
+            "the base model is already frozen."
         ),
     )
     _add(parser, "param_dtype", choices=("bfloat16", "float32"), default="bfloat16")
@@ -432,6 +455,10 @@ def parse_args(argv: list[str] | None = None) -> TrainingArguments:
             and namespace.mlp_chunk_size == 0
             and namespace.gradient_checkpointing == "nothing_saveable"
         )
+    if namespace.frozen_parameters is not None:
+        namespace.frozen_parameters = "|".join(
+            parse_frozen_parameter_components(namespace.frozen_parameters)
+        )
     args = TrainingArguments(**vars(namespace))
     if args.max_sequence_length <= 1:
         raise ValueError("max_sequence_length must be greater than one")
@@ -479,8 +506,6 @@ def parse_args(argv: list[str] | None = None) -> TrainingArguments:
             raise ValueError("EndPrompt loss weights must be finite and non-negative")
         if not any(weight > 0.0 for weight in weights):
             raise ValueError("at least one EndPrompt loss weight must be positive")
-    if args.frozen_parameters is not None and not args.lora:
-        raise ValueError("frozen_parameters is accepted only with --lora True")
     if args.lora and args.save_optimizer_state and not args.lora_save_adapter_only:
         raise ValueError(
             "LoRA optimizer state can be saved only with "
@@ -489,4 +514,10 @@ def parse_args(argv: list[str] | None = None) -> TrainingArguments:
     return args
 
 
-__all__ = ["TrainingArguments", "build_parser", "parse_args", "parse_bool"]
+__all__ = [
+    "TrainingArguments",
+    "build_parser",
+    "parse_args",
+    "parse_bool",
+    "parse_frozen_parameter_components",
+]
