@@ -83,7 +83,6 @@ def _validate_supported_config(
         "hidden_size=4096": config.hidden_size == 4096,
         "initializer_range=0.02": config.initializer_range == 0.02,
         "intermediate_size=13568": config.intermediate_size == 13_568,
-        "max_position_embeddings=2097152": config.max_position_embeddings == 2_097_152,
         "num_attention_heads=32": config.num_attention_heads == 32,
         "num_hidden_layers=40": config.num_hidden_layers == 40,
         "num_key_value_heads=1": config.num_key_value_heads == 1,
