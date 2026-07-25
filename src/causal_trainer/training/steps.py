@@ -35,6 +35,7 @@ def make_train_step(
     replicated_named_sharding,
     gather_kv_projection_weights: bool = False,
     scan_layers: bool = False,
+    external_learning_rate: bool = False,
 ):
     if gradient_accumulation_steps <= 0:
         raise ValueError("gradient_accumulation_steps must be positive")
@@ -115,7 +116,10 @@ def make_train_step(
             params,
         )
         grad_norm = optax.global_norm(grads)
+        learning_rate = learning_rate_schedule(step)
         updates, optimizer_state = optimizer.update(grads, optimizer_state, params)
+        if external_learning_rate:
+            updates = jax.tree.map(lambda update: update * learning_rate, updates)
         updates = jax.tree.map(lambda update, parameter: update.astype(parameter.dtype), updates, params)
         updated = optax.apply_updates(params, updates)
         # Full training intentionally keeps checkpoint parameters in param_dtype.
@@ -125,7 +129,7 @@ def make_train_step(
             "nll_sum": nll_sum,
             "token_count": token_count,
             "grad_norm": grad_norm,
-            "learning_rate": learning_rate_schedule(step),
+            "learning_rate": learning_rate,
         }
         return params, optimizer_state, metrics
 
@@ -170,6 +174,7 @@ def make_frozen_full_train_step(
     lm_head_trainable: bool,
     gather_kv_projection_weights: bool = False,
     scan_layers: bool = False,
+    external_learning_rate: bool = False,
 ):
     """Build a full-rank step that excludes frozen leaves from autodiff and AdamW."""
 
@@ -262,7 +267,10 @@ def make_frozen_full_train_step(
             trainable_params,
         )
         grad_norm = optax.global_norm(grads)
+        learning_rate = learning_rate_schedule(step)
         updates, optimizer_state = optimizer.update(grads, optimizer_state, trainable_params)
+        if external_learning_rate:
+            updates = jax.tree.map(lambda update: update * learning_rate, updates)
         updates = jax.tree.map(
             lambda update, parameter: update.astype(parameter.dtype),
             updates,
@@ -279,7 +287,7 @@ def make_frozen_full_train_step(
             "nll_sum": nll_sum,
             "token_count": token_count,
             "grad_norm": grad_norm,
-            "learning_rate": learning_rate_schedule(step),
+            "learning_rate": learning_rate,
         }
         return trainable_params, optimizer_state, metrics
 
@@ -325,6 +333,7 @@ def make_lora_train_step(
     train_embed_and_lm_head: bool = False,
     gather_kv_projection_weights: bool = False,
     scan_layers: bool = False,
+    external_learning_rate: bool = False,
 ):
     """Build a step over adapters and, optionally, embedding/head leaves."""
 
@@ -428,7 +437,10 @@ def make_lora_train_step(
             lora_params,
         )
         grad_norm = optax.global_norm(grads)
+        learning_rate = learning_rate_schedule(step)
         updates, optimizer_state = optimizer.update(grads, optimizer_state, lora_params)
+        if external_learning_rate:
+            updates = jax.tree.map(lambda update: update * learning_rate, updates)
         updates = jax.tree.map(
             lambda update, parameter: update.astype(parameter.dtype),
             updates,
@@ -445,7 +457,7 @@ def make_lora_train_step(
             "nll_sum": nll_sum,
             "token_count": token_count,
             "grad_norm": grad_norm,
-            "learning_rate": learning_rate_schedule(step),
+            "learning_rate": learning_rate,
         }
         return lora_params, optimizer_state, metrics
 

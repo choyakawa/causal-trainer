@@ -18,6 +18,37 @@ def test_cosine_end_is_an_absolute_learning_rate() -> None:
     assert jnp.allclose(schedule(100), 5e-6)
 
 
+def test_external_learning_rate_leaves_adamw_updates_unscaled() -> None:
+    params = {"kernel": jnp.ones((1, 1), dtype=jnp.float32)}
+    gradients = {"kernel": jnp.ones((1, 1), dtype=jnp.float32)}
+
+    def schedule(_position):
+        return jnp.asarray(0.25, dtype=jnp.float32)
+
+    options = {
+        "weight_decay": 0.0,
+        "max_grad_norm": 0.0,
+        "beta1": 0.0,
+        "beta2": 0.0,
+        "epsilon": 1e-8,
+    }
+    internal = build_optimizer(params, schedule, **options)
+    external = build_optimizer(
+        params,
+        schedule,
+        external_learning_rate=True,
+        **options,
+    )
+
+    internal_updates, _ = internal.update(gradients, internal.init(params), params)
+    external_updates, _ = external.update(gradients, external.init(params), params)
+
+    np.testing.assert_allclose(
+        external_updates["kernel"] * schedule(0),
+        internal_updates["kernel"],
+    )
+
+
 def test_optimizer_template_and_shardings_do_not_require_concrete_moments() -> None:
     devices = np.asarray(jax.devices()[:1], dtype=object).reshape((1, 1, 1, 1, 1))
     mesh = Mesh(devices, MESH_AXIS_NAMES)

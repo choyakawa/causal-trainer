@@ -48,6 +48,7 @@ def build_optimizer(
     beta1: float,
     beta2: float,
     epsilon: float,
+    external_learning_rate: bool = False,
 ) -> optax.GradientTransformation:
     decay_mask = jax.tree.map(lambda value: value.ndim > 1, params)
     transformations: list[optax.GradientTransformation] = []
@@ -55,7 +56,11 @@ def build_optimizer(
         transformations.append(optax.clip_by_global_norm(max_grad_norm))
     transformations.append(
         optax.adamw(
-            learning_rate=schedule,
+            # Streaming packing cannot infer an exact optimizer-step horizon
+            # from source-example metadata. In external mode the train step
+            # supplies the schedule position and scales the complete AdamW
+            # gradient + weight-decay update.
+            learning_rate=1.0 if external_learning_rate else schedule,
             b1=beta1,
             b2=beta2,
             eps=epsilon,

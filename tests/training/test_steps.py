@@ -38,7 +38,7 @@ def test_frozen_full_step_uses_frozen_head_contract_and_updates_only_trainables(
 
     trainable_params = {"body": jnp.asarray([1.0], jnp.float32)}
     frozen_params = {"lm_head": {"kernel": jnp.asarray([[2.0]], jnp.float32)}}
-    optimizer = optax.sgd(0.1)
+    optimizer = optax.sgd(1.0)
     optimizer_state = optimizer.init(trainable_params)
     train_step = steps.make_frozen_full_train_step(
         object(),
@@ -61,6 +61,7 @@ def test_frozen_full_step_uses_frozen_head_contract_and_updates_only_trainables(
         batch_named_sharding=None,
         replicated_named_sharding=None,
         lm_head_trainable=False,
+        external_learning_rate=True,
     )
     batch = {
         "input_ids": jnp.asarray([[1, 2]], jnp.int32),
@@ -82,3 +83,124 @@ def test_frozen_full_step_uses_frozen_head_contract_and_updates_only_trainables(
     assert jnp.allclose(updated["body"], jnp.asarray([0.8], jnp.float32))
     assert jnp.allclose(metrics["loss"], 2.0)
     assert jnp.allclose(metrics["grad_norm"], 2.0)
+    assert jnp.allclose(metrics["learning_rate"], 0.1)
+
+
+def test_full_step_external_learning_rate_scales_updates_and_metric(
+    monkeypatch,
+) -> None:
+    def fake_decoder(params, _config, input_ids, **_kwargs):
+        return jnp.broadcast_to(params["body"], (*input_ids.shape, 1))
+
+    def fake_loss(hidden_states, lm_head_kernel, *_args, **_kwargs):
+        return (
+            jnp.sum(hidden_states) * lm_head_kernel[0, 0],
+            jnp.asarray(hidden_states.shape[1], jnp.float32),
+        )
+
+    monkeypatch.setattr(steps, "decoder_forward", fake_decoder)
+    monkeypatch.setattr(steps, "chunked_causal_lm_loss", fake_loss)
+
+    params = {
+        "body": jnp.asarray([1.0], jnp.float32),
+        "lm_head": {"kernel": jnp.asarray([[2.0]], jnp.float32)},
+    }
+    optimizer = optax.sgd(1.0)
+    train_step = steps.make_train_step(
+        object(),
+        None,
+        optimizer,
+        lambda position: position.astype(jnp.float32) / 10.0,
+        attention_implementation="vanilla",
+        gradient_accumulation_steps=1,
+        remat_policy="none",
+        compute_dtype=jnp.float32,
+        block_q=1,
+        block_k=1,
+        loss_token_budget=1,
+        loss_implementation="xla",
+        mlp_chunk_size=0,
+        sparse_loss_skip=False,
+        param_shardings=None,
+        optimizer_state_shardings=None,
+        batch_named_sharding=None,
+        replicated_named_sharding=None,
+        external_learning_rate=True,
+    )
+    batch = {
+        "input_ids": jnp.asarray([[1, 2]], jnp.int32),
+        "attention_mask": jnp.ones((1, 2), jnp.bool_),
+        "position_ids": jnp.asarray([[0, 1]], jnp.int32),
+        "segment_ids": jnp.zeros((1, 2), jnp.int32),
+        "loss_weights": jnp.ones((1, 2), jnp.float32),
+    }
+
+    updated, _, metrics = train_step(
+        params,
+        optimizer.init(params),
+        batch,
+        jnp.asarray(3, jnp.int32),
+    )
+
+    assert jnp.allclose(updated["body"], jnp.asarray([0.4], jnp.float32))
+    assert jnp.allclose(metrics["learning_rate"], 0.3)
+
+
+def test_lora_step_external_learning_rate_scales_updates_and_metric(
+    monkeypatch,
+) -> None:
+    def fake_decoder(_params, _config, input_ids, *, lora_params, **_kwargs):
+        return jnp.broadcast_to(lora_params["adapter"], (*input_ids.shape, 1))
+
+    def fake_loss(hidden_states, lm_head_kernel, *_args, **_kwargs):
+        return (
+            jnp.sum(hidden_states) * lm_head_kernel[0, 0],
+            jnp.asarray(hidden_states.shape[1], jnp.float32),
+        )
+
+    monkeypatch.setattr(steps, "decoder_forward", fake_decoder)
+    monkeypatch.setattr(steps, "chunked_causal_lm_loss", fake_loss)
+
+    base_params = {"lm_head": {"kernel": jnp.asarray([[2.0]], jnp.float32)}}
+    lora_params = {"adapter": jnp.asarray([1.0], jnp.float32)}
+    optimizer = optax.sgd(1.0)
+    train_step = steps.make_lora_train_step(
+        object(),
+        None,
+        optimizer,
+        lambda position: position.astype(jnp.float32) / 10.0,
+        attention_implementation="vanilla",
+        gradient_accumulation_steps=1,
+        remat_policy="none",
+        compute_dtype=jnp.float32,
+        block_q=1,
+        block_k=1,
+        loss_token_budget=1,
+        loss_implementation="xla",
+        mlp_chunk_size=0,
+        sparse_loss_skip=False,
+        base_param_shardings=None,
+        lora_param_shardings=None,
+        optimizer_state_shardings=None,
+        batch_named_sharding=None,
+        replicated_named_sharding=None,
+        external_learning_rate=True,
+    )
+    batch = {
+        "input_ids": jnp.asarray([[1, 2]], jnp.int32),
+        "attention_mask": jnp.ones((1, 2), jnp.bool_),
+        "position_ids": jnp.asarray([[0, 1]], jnp.int32),
+        "segment_ids": jnp.zeros((1, 2), jnp.int32),
+        "loss_weights": jnp.ones((1, 2), jnp.float32),
+    }
+
+    updated, _, metrics = train_step(
+        base_params,
+        lora_params,
+        optimizer.init(lora_params),
+        batch,
+        jnp.asarray(3, jnp.int32),
+    )
+
+    assert jnp.allclose(updated["adapter"], jnp.asarray([0.4], jnp.float32))
+    assert jnp.allclose(metrics["learning_rate"], 0.3)

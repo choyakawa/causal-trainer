@@ -6,6 +6,7 @@ from datasets import Dataset, Features, Sequence, Value
 
 from causal_trainer.data.pipeline import (
     contiguous_shard_bounds,
+    load_training_split,
     packed_dataset_to_arrays,
     pad_packed_arrays_to_batch_multiple,
     prepare_training_dataset,
@@ -27,6 +28,39 @@ def _canonical_columns(rows: int = 3, sequence_length: int = 4) -> dict[str, np.
         "assistant_masks": np.ones_like(input_ids),
         "loss_weights": np.ones(input_ids.shape, dtype=np.float32),
     }
+
+
+def test_hub_streaming_loader_forwards_config_revision_and_token(monkeypatch) -> None:
+    calls = []
+    sentinel = object()
+
+    def fake_load_dataset(*args, **kwargs):
+        calls.append((args, kwargs))
+        return sentinel
+
+    monkeypatch.setattr("causal_trainer.data.pipeline.load_dataset", fake_load_dataset)
+
+    result = load_training_split(
+        "org/large-corpus",
+        "train",
+        token="secret",
+        config_name="clean",
+        revision="dataset-commit",
+        streaming=True,
+    )
+
+    assert result is sentinel
+    assert calls == [
+        (
+            ("org/large-corpus", "clean"),
+            {
+                "split": "train",
+                "token": "secret",
+                "revision": "dataset-commit",
+                "streaming": True,
+            },
+        )
+    ]
 
 
 @pytest.mark.parametrize("size", [0, 1, 2, 7, 10])

@@ -57,6 +57,12 @@ class TrainingArguments:
     dataset_name: str
     dataset_split: str
     dataset_text_field: str
+    dataset_streaming: bool
+    dataset_config_name: str | None
+    dataset_revision: str | None
+    streaming_shuffle_buffer: int
+    hf_retry_initial_delay: float
+    hf_retry_max_delay: float
     processor_repo_id: str | None
     output_dir: Path
     revision: str | None
@@ -161,6 +167,45 @@ def build_parser() -> argparse.ArgumentParser:
     _add(parser, "dataset_name", required=True, help="Local dataset file/directory or Hugging Face dataset ID.")
     _add(parser, "dataset_split", default="train")
     _add(parser, "dataset_text_field", default="text", help="Use 'messages' for conversational records.")
+    _add_bool(
+        parser,
+        "dataset_streaming",
+        False,
+        "Stream dataset records without materializing the complete split in memory or on local disk.",
+    )
+    _add(
+        parser,
+        "dataset_config_name",
+        default=None,
+        help="Optional Hugging Face dataset configuration/subset name.",
+    )
+    _add(
+        parser,
+        "dataset_revision",
+        default=None,
+        help="Optional Hugging Face dataset revision, independent of the model revision.",
+    )
+    _add(
+        parser,
+        "streaming_shuffle_buffer",
+        type=int,
+        default=10_000,
+        help="In-memory shuffle buffer used for streaming datasets.",
+    )
+    _add(
+        parser,
+        "hf_retry_initial_delay",
+        type=float,
+        default=1.0,
+        help="Initial delay in seconds before retrying a transient Hugging Face read failure.",
+    )
+    _add(
+        parser,
+        "hf_retry_max_delay",
+        type=float,
+        default=60.0,
+        help="Maximum delay in seconds between retries for transient Hugging Face read failures.",
+    )
     _add(parser, "processor_repo_id", default=None)
     _add(parser, "output_dir", type=Path, default=Path("causal-trainer-output"))
     _add(parser, "revision", default=None)
@@ -209,7 +254,10 @@ def build_parser() -> argparse.ArgumentParser:
         "preprocessing_num_workers",
         type=int,
         default=None,
-        help="Tokenizer worker processes used independently inside each JAX process.",
+        help=(
+            "Tokenizer worker processes used independently inside each JAX process; "
+            "not supported by the single-process streaming pipeline."
+        ),
     )
     _add(
         parser,
@@ -218,7 +266,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="shard_then_merge",
         help=(
             "Shard source rows across JAX processes, preprocess/pack locally, and merge the prepared "
-            "arrays over the network before training; 'replicated' preprocesses all rows everywhere."
+            "arrays over the network before training; 'replicated' preprocesses all rows everywhere. "
+            "Streaming uses a deterministic replicated stream on every process and ignores this setting."
         ),
     )
 
@@ -464,10 +513,33 @@ def parse_args(argv: list[str] | None = None) -> TrainingArguments:
         raise ValueError("max_sequence_length must be greater than one")
     if args.num_train_epochs <= 0 and args.max_steps <= 0:
         raise ValueError("num_train_epochs must be positive unless max_steps is set")
+    if (
+        args.dataset_streaming
+        and args.max_steps <= 0
+        and not args.num_train_epochs.is_integer()
+    ):
+        raise ValueError(
+            "streaming datasets require an integer num_train_epochs unless max_steps is set"
+        )
     if args.total_batch_size <= 0 or args.gradient_accumulation_steps <= 0:
         raise ValueError("batch size and gradient accumulation must be positive")
     if args.packing_batch_size <= 0 or args.logging_steps <= 0:
         raise ValueError("packing_batch_size and logging_steps must be positive")
+    if args.streaming_shuffle_buffer <= 0:
+        raise ValueError("streaming_shuffle_buffer must be positive")
+    if (
+        not math.isfinite(args.hf_retry_initial_delay)
+        or not math.isfinite(args.hf_retry_max_delay)
+        or args.hf_retry_initial_delay <= 0
+        or args.hf_retry_max_delay <= 0
+    ):
+        raise ValueError("Hugging Face retry delays must be positive")
+    if args.hf_retry_initial_delay > args.hf_retry_max_delay:
+        raise ValueError("hf_retry_initial_delay cannot exceed hf_retry_max_delay")
+    if args.dataset_streaming and args.preprocessing_num_workers is not None:
+        raise ValueError(
+            "preprocessing_num_workers is not supported with dataset_streaming"
+        )
     if args.preprocessing_num_workers is not None and args.preprocessing_num_workers <= 0:
         raise ValueError("preprocessing_num_workers must be positive when provided")
     if args.warmup_steps < 0 or args.weight_distribution_log_steps < 0 or args.seed < 0:

@@ -85,6 +85,9 @@ class ResumeCheckpoint:
     checkpoint_id: str
     manifest_digest: str
     artifact_kind: str = "merged"
+    source_examples_seen: int = 0
+    training_complete: bool = False
+    streaming_data_digest: str | None = None
 
 
 def training_signature(payload: Any) -> str:
@@ -688,6 +691,29 @@ def find_latest_checkpoint(
             corrupt.append(path)
             continue
         has_optimizer_state = manifest["has_optimizer_state"]
+        source_examples_seen = manifest.get("source_examples_seen", 0)
+        training_complete = manifest.get("training_complete", False)
+        streaming_data_digest = manifest.get("streaming_data_digest")
+        if (
+            type(source_examples_seen) is not int
+            or source_examples_seen < 0
+            or not isinstance(training_complete, bool)
+            or (
+                streaming_data_digest is not None
+                and not _is_lower_hex(streaming_data_digest, 64)
+            )
+            or (source_examples_seen > 0 and streaming_data_digest is None)
+            or (
+                training_complete
+                and (
+                    path != root
+                    or global_step != total_steps
+                    or streaming_data_digest is None
+                )
+            )
+        ):
+            corrupt.append(path)
+            continue
         if (
             not _artifact_sizes_match(
                 path,
@@ -723,6 +749,9 @@ def find_latest_checkpoint(
                 checkpoint_id,
                 training_signature(manifest),
                 artifact_kind,
+                source_examples_seen,
+                training_complete,
+                streaming_data_digest,
             )
         )
 
@@ -736,7 +765,14 @@ def find_latest_checkpoint(
         raise ValueError("output_dir contains corrupt completed checkpoints: " + locations)
     if not candidates:
         return None
-    return max(candidates, key=lambda checkpoint: (checkpoint.global_step, checkpoint.path == root))
+    return max(
+        candidates,
+        key=lambda checkpoint: (
+            checkpoint.training_complete and checkpoint.path == root,
+            checkpoint.global_step,
+            checkpoint.path == root,
+        ),
+    )
 
 
 def save_checkpoint_bundle(
@@ -754,6 +790,9 @@ def save_checkpoint_bundle(
     expected_model_layout: dict[str, tuple[str, tuple[int, ...]]] | None = None,
     leaf_transform: Callable[[str, Any], Any] | None = None,
     transform_plan: Mapping[str, Any] | None = None,
+    source_examples_seen: int = 0,
+    training_complete: bool = False,
+    streaming_data_digest: str | None = None,
 ) -> Path:
     """Export a model and, when requested, its matching optimizer state."""
 
@@ -780,7 +819,10 @@ def save_checkpoint_bundle(
                 "leaf_transform": leaf_transform is not None,
                 "save_optimizer_state": save_optimizer_state,
                 "step": step,
+                "source_examples_seen": source_examples_seen,
+                "streaming_data_digest": streaming_data_digest,
                 "total_steps": total_steps,
+                "training_complete": training_complete,
                 "training_signature": training_signature,
                 "transform_plan": transform_plan,
             }
@@ -791,6 +833,24 @@ def save_checkpoint_bundle(
     # checkpoint collective.
     if total_steps <= 0 or not 0 <= step <= total_steps:
         raise ValueError(f"checkpoint step {step} must be in [0, {total_steps}]")
+    if type(source_examples_seen) is not int or source_examples_seen < 0:
+        raise ValueError("source_examples_seen must be a non-negative integer")
+    if not isinstance(training_complete, bool):
+        raise TypeError("training_complete must be a boolean")
+    if streaming_data_digest is not None and not _is_lower_hex(
+        streaming_data_digest,
+        64,
+    ):
+        raise ValueError("streaming_data_digest must be a lowercase SHA-256 digest or None")
+    if source_examples_seen > 0 and streaming_data_digest is None:
+        raise ValueError("streaming progress requires streaming_data_digest")
+    if training_complete and (
+        step != total_steps or streaming_data_digest is None
+    ):
+        raise ValueError(
+            "a completed streaming checkpoint requires step == total_steps "
+            "and streaming_data_digest"
+        )
     if not isinstance(training_signature, str) or len(training_signature) != 64 or any(
         character not in "0123456789abcdef" for character in training_signature
     ):
@@ -874,7 +934,10 @@ def save_checkpoint_bundle(
                     "format_version": _BUNDLE_FORMAT_VERSION,
                     "global_step": int(step),
                     "has_optimizer_state": save_optimizer_state,
+                    "source_examples_seen": int(source_examples_seen),
+                    "streaming_data_digest": streaming_data_digest,
                     "total_steps": int(total_steps),
+                    "training_complete": training_complete,
                     "training_signature": training_signature,
                 },
             )
@@ -898,6 +961,9 @@ def save_adapter_checkpoint_bundle(
     training_signature: str,
     total_steps: int,
     expected_adapter_layout: dict[str, tuple[str, tuple[int, ...]]] | None = None,
+    source_examples_seen: int = 0,
+    training_complete: bool = False,
+    streaming_data_digest: str | None = None,
 ) -> Path:
     """Export a PEFT adapter and its optional matching optimizer state."""
 
@@ -924,13 +990,34 @@ def save_adapter_checkpoint_bundle(
                 "artifact_kind": "peft-adapter",
                 "save_optimizer_state": save_optimizer_state,
                 "step": step,
+                "source_examples_seen": source_examples_seen,
+                "streaming_data_digest": streaming_data_digest,
                 "total_steps": total_steps,
+                "training_complete": training_complete,
                 "training_signature": training_signature,
             }
         ],
     )
     if total_steps <= 0 or not 0 <= step <= total_steps:
         raise ValueError(f"checkpoint step {step} must be in [0, {total_steps}]")
+    if type(source_examples_seen) is not int or source_examples_seen < 0:
+        raise ValueError("source_examples_seen must be a non-negative integer")
+    if not isinstance(training_complete, bool):
+        raise TypeError("training_complete must be a boolean")
+    if streaming_data_digest is not None and not _is_lower_hex(
+        streaming_data_digest,
+        64,
+    ):
+        raise ValueError("streaming_data_digest must be a lowercase SHA-256 digest or None")
+    if source_examples_seen > 0 and streaming_data_digest is None:
+        raise ValueError("streaming progress requires streaming_data_digest")
+    if training_complete and (
+        step != total_steps or streaming_data_digest is None
+    ):
+        raise ValueError(
+            "a completed streaming checkpoint requires step == total_steps "
+            "and streaming_data_digest"
+        )
     if not _is_lower_hex(training_signature, 64):
         raise ValueError("training_signature must be a lowercase SHA-256 hex digest")
     if save_optimizer_state and optimizer_state is None:
@@ -1012,7 +1099,10 @@ def save_adapter_checkpoint_bundle(
                     "format_version": _BUNDLE_FORMAT_VERSION,
                     "global_step": int(step),
                     "has_optimizer_state": save_optimizer_state,
+                    "source_examples_seen": int(source_examples_seen),
+                    "streaming_data_digest": streaming_data_digest,
                     "total_steps": int(total_steps),
+                    "training_complete": training_complete,
                     "training_signature": training_signature,
                 },
             )

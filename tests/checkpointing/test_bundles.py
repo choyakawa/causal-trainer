@@ -202,7 +202,10 @@ def test_checkpoint_bundle_omits_optimizer_when_disabled(monkeypatch, tmp_path) 
                     "leaf_transform": True,
                     "save_optimizer_state": False,
                     "step": 4,
+                    "source_examples_seen": 0,
+                    "streaming_data_digest": None,
                     "total_steps": 10,
+                    "training_complete": False,
                     "training_signature": SIGNATURE,
                     "transform_plan": transform_plan,
                 }
@@ -727,6 +730,87 @@ def test_resume_action_rejects_different_training_plan(tmp_path) -> None:
         _resume_action(checkpoint, output_dir=tmp_path, total_steps=10)
 
 
+def test_resume_action_accepts_completed_streaming_checkpoint_with_fewer_steps(
+    tmp_path,
+) -> None:
+    checkpoint = ResumeCheckpoint(
+        tmp_path,
+        3,
+        3,
+        False,
+        CHECKPOINT_ID,
+        MANIFEST_DIGEST,
+        source_examples_seen=100,
+        training_complete=True,
+        streaming_data_digest="f" * 64,
+    )
+
+    assert _resume_action(checkpoint, output_dir=tmp_path, total_steps=10) == "complete"
+
+
+def test_checkpoint_discovery_restores_streaming_progress_fields(tmp_path) -> None:
+    _write_completed_bundle(tmp_path, 3, SIGNATURE)
+    manifest_path = tmp_path / "checkpoint_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["source_examples_seen"] = 123
+    manifest["streaming_data_digest"] = "f" * 64
+    manifest["training_complete"] = True
+    manifest["total_steps"] = 3
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    checkpoint = find_latest_checkpoint(tmp_path, SIGNATURE)
+
+    assert checkpoint is not None
+    assert checkpoint.source_examples_seen == 123
+    assert checkpoint.training_complete is True
+    assert checkpoint.streaming_data_digest == "f" * 64
+
+
+def test_completed_root_checkpoint_is_preferred_over_higher_periodic_step(
+    tmp_path,
+) -> None:
+    _write_completed_bundle(tmp_path, 3, SIGNATURE)
+    root_manifest_path = tmp_path / "checkpoint_manifest.json"
+    root_manifest = json.loads(root_manifest_path.read_text(encoding="utf-8"))
+    root_manifest.update(
+        {
+            "source_examples_seen": 100,
+            "streaming_data_digest": "f" * 64,
+            "training_complete": True,
+            "total_steps": 3,
+        }
+    )
+    root_manifest_path.write_text(json.dumps(root_manifest), encoding="utf-8")
+    _write_completed_bundle(tmp_path / "checkpoint-8", 8, SIGNATURE)
+
+    checkpoint = find_latest_checkpoint(tmp_path, SIGNATURE)
+
+    assert checkpoint is not None
+    assert checkpoint.path == tmp_path
+    assert checkpoint.training_complete is True
+
+
+def test_completed_streaming_checkpoint_is_rejected_in_periodic_directory(
+    tmp_path,
+) -> None:
+    periodic = tmp_path / "checkpoint-3"
+    _write_completed_bundle(periodic, 3, SIGNATURE)
+    manifest_path = periodic / "checkpoint_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.update(
+        {
+            "source_examples_seen": 100,
+            "streaming_data_digest": "f" * 64,
+            "training_complete": True,
+            "total_steps": 3,
+        }
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="corrupt completed checkpoints"):
+        find_latest_checkpoint(tmp_path, SIGNATURE)
+
+
 def test_resume_identity_binds_checkpoint_and_manifest_identity(tmp_path) -> None:
     first = ResumeCheckpoint(
         tmp_path / "checkpoint-4",
@@ -783,6 +867,19 @@ def test_resume_identity_binds_checkpoint_and_manifest_identity(tmp_path) -> Non
     )
     assert first_identity != _resume_identity_values(
         ResumeCheckpoint(
+            first.path,
+            first.global_step,
+            first.total_steps,
+            first.has_optimizer_state,
+            first.checkpoint_id,
+            first.manifest_digest,
+            streaming_data_digest="f" * 64,
+        ),
+        output_dir=tmp_path,
+        training_signature=SIGNATURE,
+    )
+    assert first_identity != _resume_identity_values(
+        ResumeCheckpoint(
             tmp_path,
             first.global_step,
             first.total_steps,
@@ -793,3 +890,27 @@ def test_resume_identity_binds_checkpoint_and_manifest_identity(tmp_path) -> Non
         output_dir=tmp_path,
         training_signature=SIGNATURE,
     )
+
+
+def test_resume_identity_hashes_large_counters_without_fixed_width_conversion(
+    tmp_path,
+) -> None:
+    checkpoint = ResumeCheckpoint(
+        tmp_path / "checkpoint-large",
+        2**80,
+        2**81,
+        True,
+        "1" * 32,
+        "2" * 64,
+        source_examples_seen=2**100,
+        streaming_data_digest="3" * 64,
+    )
+
+    identity = _resume_identity_values(
+        checkpoint,
+        output_dir=tmp_path,
+        training_signature=SIGNATURE,
+    )
+
+    assert len(identity) == 32
+    assert all(0 <= value <= 255 for value in identity)

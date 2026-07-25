@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from datasets import Dataset, Features, Value, load_dataset
+from datasets import Dataset, Features, IterableDataset, Value, load_dataset
 from datasets import Sequence as DatasetSequence
 
 from .packing import PackedExample, Scalar, pack_examples, pad_examples
@@ -118,7 +118,15 @@ class PackedArrayDataset:
         return {name: value[index] for name, value in self._columns.items()}
 
 
-def load_training_split(name: str, split: str, *, token: str | None = None) -> Dataset:
+def load_training_split(
+    name: str,
+    split: str,
+    *,
+    token: str | None = None,
+    config_name: str | None = None,
+    revision: str | None = None,
+    streaming: bool = False,
+) -> Dataset | IterableDataset:
     """Load either a Hub dataset or a common local tabular file."""
 
     path = Path(name)
@@ -133,11 +141,24 @@ def load_training_split(name: str, split: str, *, token: str | None = None) -> D
         }.get(suffix)
         if loader is None:
             raise ValueError(f"unsupported local dataset extension: {suffix}")
-        kwargs: dict[str, Any] = {"data_files": str(path), "split": split}
+        if config_name is not None:
+            raise ValueError("dataset_config_name is not supported for a local dataset file")
+        kwargs: dict[str, Any] = {
+            "data_files": str(path),
+            "split": split,
+            "streaming": streaming,
+        }
         if suffix == ".tsv":
             kwargs["delimiter"] = "\t"
         return load_dataset(loader, **kwargs)
-    return load_dataset(name, split=split, token=token)
+    return load_dataset(
+        name,
+        config_name,
+        split=split,
+        token=token,
+        revision=revision,
+        streaming=streaming,
+    )
 
 
 def contiguous_shard_bounds(size: int, process_index: int, process_count: int) -> tuple[int, int]:

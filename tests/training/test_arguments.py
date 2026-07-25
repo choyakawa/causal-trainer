@@ -137,6 +137,12 @@ def test_cli_accepts_bare_boolean_and_hyphenated_names() -> None:
 def test_save_optimizer_state_defaults_to_false() -> None:
     args = parse_args(["--repo-id", "local-model", "--dataset-name", "local-data"])
     assert args.save_optimizer_state is False
+    assert args.dataset_streaming is False
+    assert args.dataset_config_name is None
+    assert args.dataset_revision is None
+    assert args.streaming_shuffle_buffer == 10_000
+    assert args.hf_retry_initial_delay == 1.0
+    assert args.hf_retry_max_delay == 60.0
     assert args.learning_rate_end == 0.0
     assert args.endprompt_enable is False
     assert args.frozen_parameters is None
@@ -144,6 +150,121 @@ def test_save_optimizer_state_defaults_to_false() -> None:
     assert args.lora_train_embed_and_lm_head is False
     assert args.preprocessing_mode == "shard_then_merge"
     assert args.sharding_axis == "-1,1,1,4,1"
+
+
+def test_cli_accepts_streaming_dataset_options() -> None:
+    args = parse_args(
+        [
+            "--repo-id",
+            "local-model",
+            "--dataset-name",
+            "org/large-dataset",
+            "--dataset-streaming",
+            "--dataset_config_name",
+            "clean",
+            "--dataset-revision",
+            "dataset-commit",
+            "--streaming-shuffle-buffer",
+            "2048",
+            "--hf-retry-initial-delay",
+            "0.5",
+            "--hf_retry_max_delay",
+            "30",
+            "--preprocessing-mode",
+            "replicated",
+            "--num-train-epochs",
+            "2",
+        ]
+    )
+
+    assert args.dataset_streaming is True
+    assert args.dataset_config_name == "clean"
+    assert args.dataset_revision == "dataset-commit"
+    assert args.streaming_shuffle_buffer == 2048
+    assert args.hf_retry_initial_delay == 0.5
+    assert args.hf_retry_max_delay == 30.0
+    assert args.preprocessing_mode == "replicated"
+
+
+def test_streaming_dataset_rejects_preprocessing_workers() -> None:
+    with pytest.raises(
+        ValueError,
+        match="preprocessing_num_workers is not supported with dataset_streaming",
+    ):
+        parse_args(
+            [
+                "--repo-id",
+                "local-model",
+                "--dataset-name",
+                "org/large-dataset",
+                "--dataset-streaming",
+                "--preprocessing-num-workers",
+                "2",
+            ]
+        )
+
+
+@pytest.mark.parametrize("epochs", ["0", "-1", "1.5"])
+def test_streaming_epoch_budget_requires_a_positive_integer(epochs: str) -> None:
+    with pytest.raises(ValueError, match="num_train_epochs"):
+        parse_args(
+            [
+                "--repo-id",
+                "local-model",
+                "--dataset-name",
+                "org/large-dataset",
+                "--dataset-streaming",
+                "--num-train-epochs",
+                epochs,
+            ]
+        )
+
+
+def test_streaming_fractional_epochs_are_allowed_with_max_steps() -> None:
+    args = parse_args(
+        [
+            "--repo-id",
+            "local-model",
+            "--dataset-name",
+            "org/large-dataset",
+            "--dataset-streaming",
+            "--num-train-epochs",
+            "0.5",
+            "--max-steps",
+            "7",
+        ]
+    )
+    assert args.num_train_epochs == 0.5
+    assert args.max_steps == 7
+
+
+@pytest.mark.parametrize(
+    ("options", "match"),
+    [
+        (["--streaming-shuffle-buffer", "0"], "streaming_shuffle_buffer must be positive"),
+        (["--hf-retry-initial-delay", "0"], "retry delays must be positive"),
+        (["--hf-retry-max-delay", "0"], "retry delays must be positive"),
+        (["--hf-retry-max-delay", "nan"], "retry delays must be positive"),
+        (
+            ["--hf-retry-initial-delay", "61", "--hf-retry-max-delay", "60"],
+            "hf_retry_initial_delay cannot exceed hf_retry_max_delay",
+        ),
+    ],
+)
+def test_streaming_buffer_and_retry_delays_are_validated(
+    options: list[str],
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        parse_args(
+            [
+                "--repo-id",
+                "local-model",
+                "--dataset-name",
+                "org/large-dataset",
+                *options,
+            ]
+        )
 
 
 @pytest.mark.parametrize(
