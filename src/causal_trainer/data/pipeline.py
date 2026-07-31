@@ -259,6 +259,7 @@ def prepare_training_dataset(
     dataset_text_field: str,
     max_sequence_length: int,
     assistant_only_loss: bool,
+    last_assistant_only_loss: bool = False,
     endprompt: EndPromptSettings | None,
     packing: bool,
     packing_batch_size: int,
@@ -268,12 +269,15 @@ def prepare_training_dataset(
 ) -> Dataset:
     """Tokenize and finalize one source shard entirely in host memory."""
 
+    use_assistant_mask = assistant_only_loss or last_assistant_only_loss
+
     tokenized = preprocess_dataset(
         dataset,
         tokenizer,
         dataset_text_field=dataset_text_field,
         max_sequence_length=max_sequence_length,
         assistant_only_loss=assistant_only_loss,
+        last_assistant_only_loss=last_assistant_only_loss,
         endprompt=endprompt,
         num_proc=preprocessing_num_workers,
         example_index_offset=example_index_offset,
@@ -287,7 +291,7 @@ def prepare_training_dataset(
 
     final_features = _prepared_features(
         max_sequence_length=max_sequence_length,
-        assistant_only_loss=assistant_only_loss,
+        assistant_only_loss=use_assistant_mask,
         has_explicit_loss_weights=endprompt is not None,
     )
     if len(tokenized) == 0:
@@ -336,13 +340,17 @@ def packed_dataset_to_arrays(
     *,
     max_sequence_length: int,
     assistant_only_loss: bool,
+    last_assistant_only_loss: bool = False,
 ) -> dict[str, np.ndarray]:
     """Convert a local Arrow result into the canonical typed merge payload."""
 
+    if assistant_only_loss and last_assistant_only_loss:
+        raise ValueError("assistant_only_loss and last_assistant_only_loss are mutually exclusive")
+    use_assistant_mask = assistant_only_loss or last_assistant_only_loss
     rows = len(dataset)
     actual = set(dataset.column_names)
     required = set(MODEL_FIELDS)
-    if assistant_only_loss:
+    if use_assistant_mask:
         required.add("assistant_masks")
     missing = sorted(required - actual)
     extra = sorted(actual - required - {"loss_weights"})
@@ -351,7 +359,7 @@ def packed_dataset_to_arrays(
 
     columns: dict[str, np.ndarray] = {}
     names = [*MODEL_FIELDS]
-    if assistant_only_loss:
+    if use_assistant_mask:
         names.append("assistant_masks")
     for name in names:
         if rows:
@@ -370,7 +378,7 @@ def packed_dataset_to_arrays(
             if rows
             else np.empty((0, max_sequence_length), dtype=np.float32)
         )
-    elif assistant_only_loss:
+    elif use_assistant_mask:
         loss_weights = columns["assistant_masks"].astype(np.float32, copy=True)
     else:
         loss_weights = columns["attention_mask"].astype(np.float32, copy=True)

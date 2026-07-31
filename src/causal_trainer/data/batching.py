@@ -67,7 +67,7 @@ def _collate(dataset, indices: np.ndarray, assistant_only_loss: bool) -> dict[st
         ]
         if missing_masks:
             raise ValueError(
-                "assistant_only_loss dataset is missing assistant_masks for records "
+                "assistant-masked loss dataset is missing assistant_masks for records "
                 f"{missing_masks}"
             )
         for record_index, record in enumerate(records):

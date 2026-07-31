@@ -17,6 +17,20 @@ from typing import Any
 TokenizedExample = dict[str, list[int] | list[float]]
 
 
+def _assistant_loss_mode(
+    *,
+    assistant_only_loss: bool,
+    last_assistant_only_loss: bool,
+) -> str | None:
+    if assistant_only_loss and last_assistant_only_loss:
+        raise ValueError("assistant_only_loss and last_assistant_only_loss are mutually exclusive")
+    if last_assistant_only_loss:
+        return "last_assistant_only_loss"
+    if assistant_only_loss:
+        return "assistant_only_loss"
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class EndPromptSettings:
     """Static terminal-anchor preprocessing settings."""
@@ -116,7 +130,7 @@ def _normalize_tokenizer_output(
     if require_assistant_mask:
         if assistant_key is None:
             raise ValueError(
-                "assistant_only_loss requires a chat template that returns an assistant token mask. "
+                "Assistant loss masking requires a chat template that returns an assistant token mask. "
                 "Add {% generation %} blocks to the tokenizer chat template."
             )
 
@@ -141,6 +155,25 @@ def _has_nonempty_assistant_content(messages: Sequence[Mapping[str, Any]]) -> bo
 
 def _empty_tokenized_example(example: TokenizedExample) -> TokenizedExample:
     return {key: [] for key in example}
+
+
+def _keep_last_assistant_span(assistant_masks: Sequence[int]) -> list[int]:
+    """Keep only the final contiguous generation span in an assistant mask."""
+
+    output = [0] * len(assistant_masks)
+    try:
+        stop = next(
+            index
+            for index in range(len(assistant_masks) - 1, -1, -1)
+            if int(assistant_masks[index]) != 0
+        )
+    except StopIteration:
+        return output
+    start = stop
+    while start > 0 and int(assistant_masks[start - 1]) != 0:
+        start -= 1
+    output[start : stop + 1] = [1] * (stop - start + 1)
+    return output
 
 
 def _trainable_assistant_indices(
@@ -397,12 +430,18 @@ def tokenize_endprompt_messages(
     *,
     max_sequence_length: int,
     assistant_only_loss: bool,
+    last_assistant_only_loss: bool = False,
     settings: EndPromptSettings,
     example_index: int,
     tools: Any | None = None,
     chat_template_kwargs: Mapping[str, Any] | None = None,
 ) -> TokenizedExample:
     """Render a conversation within the space left by an anchored prompt."""
+
+    assistant_loss_mode = _assistant_loss_mode(
+        assistant_only_loss=assistant_only_loss,
+        last_assistant_only_loss=last_assistant_only_loss,
+    )
 
     prompt_ids = _endprompt_prompt_ids(
         tokenizer,
@@ -416,6 +455,7 @@ def tokenize_endprompt_messages(
         tokenizer,
         max_sequence_length=context_budget,
         assistant_only_loss=assistant_only_loss,
+        last_assistant_only_loss=last_assistant_only_loss,
         tools=tools,
         chat_template_kwargs=chat_template_kwargs,
     )
@@ -426,7 +466,7 @@ def tokenize_endprompt_messages(
         prompt_ids,
         settings=settings,
         example_index=example_index,
-        assistant_only_loss=assistant_only_loss,
+        assistant_only_loss=assistant_loss_mode is not None,
     )
 
 
@@ -435,7 +475,8 @@ def tokenize_messages(
     tokenizer: Any,
     *,
     max_sequence_length: int,
-    assistant_only_loss: bool,
+    assistant_only_loss: bool = False,
+    last_assistant_only_loss: bool = False,
     tools: Any | None = None,
     chat_template_kwargs: Mapping[str, Any] | None = None,
 ) -> TokenizedExample:
@@ -443,6 +484,11 @@ def tokenize_messages(
 
     if max_sequence_length <= 0:
         raise ValueError("max_sequence_length must be positive.")
+    assistant_loss_mode = _assistant_loss_mode(
+        assistant_only_loss=assistant_only_loss,
+        last_assistant_only_loss=last_assistant_only_loss,
+    )
+    use_assistant_mask = assistant_loss_mode is not None
     messages = _validate_messages(messages)
     apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
     if not callable(apply_chat_template):
@@ -458,12 +504,12 @@ def tokenize_messages(
             "tokenize": True,
             "return_dict": True,
             "return_attention_mask": True,
-            "return_assistant_tokens_mask": assistant_only_loss,
+            "return_assistant_tokens_mask": use_assistant_mask,
             # Assistant spans are computed on the untruncated rendering and
             # then all token fields are sliced together below. This prevents a
             # tokenizer-side truncation boundary from changing span recovery.
-            "truncation": not assistant_only_loss,
-            "max_length": None if assistant_only_loss else max_sequence_length,
+            "truncation": not use_assistant_mask,
+            "max_length": None if use_assistant_mask else max_sequence_length,
         }
     )
     if tools is not None:
@@ -471,19 +517,21 @@ def tokenize_messages(
     encoded = apply_chat_template(messages, **template_options)
     output = _normalize_tokenizer_output(
         encoded,
-        require_assistant_mask=assistant_only_loss,
+        require_assistant_mask=use_assistant_mask,
     )
-    if not assistant_only_loss:
+    if not use_assistant_mask:
         return output
 
     if not any(output["assistant_masks"]):
         if _has_nonempty_assistant_content(messages):
             raise ValueError(
-                "assistant_only_loss was requested, but the tokenized example contains no assistant tokens "
+                f"{assistant_loss_mode} was requested, but the tokenized example contains no assistant tokens "
                 "despite having assistant content. Check that the tokenizer chat template contains "
                 "{% generation %} blocks."
             )
         return _empty_tokenized_example(output)
+    if last_assistant_only_loss:
+        output["assistant_masks"] = _keep_last_assistant_span(output["assistant_masks"])
     return _trim_to_last_assistant_token(output, max_sequence_length=max_sequence_length)
 
 
@@ -494,6 +542,7 @@ def preprocess_example(
     dataset_text_field: str,
     max_sequence_length: int,
     assistant_only_loss: bool = False,
+    last_assistant_only_loss: bool = False,
     endprompt: EndPromptSettings | None = None,
     example_index: int = 0,
 ) -> TokenizedExample:
@@ -504,12 +553,18 @@ def preprocess_example(
     intentionally rejected for raw text because no role boundary exists there.
     """
 
+    assistant_loss_mode = _assistant_loss_mode(
+        assistant_only_loss=assistant_only_loss,
+        last_assistant_only_loss=last_assistant_only_loss,
+    )
     if dataset_text_field not in example:
         raise KeyError(f"Dataset example does not contain field {dataset_text_field!r}.")
     value = example[dataset_text_field]
     if isinstance(value, str):
-        if assistant_only_loss:
-            raise ValueError("assistant_only_loss is supported only for messages examples, not raw text.")
+        if assistant_loss_mode is not None:
+            raise ValueError(
+                f"{assistant_loss_mode} is supported only for messages examples, not raw text."
+            )
         if endprompt is not None:
             return tokenize_endprompt_text(
                 value,
@@ -529,6 +584,7 @@ def preprocess_example(
             tokenizer,
             max_sequence_length=max_sequence_length,
             assistant_only_loss=assistant_only_loss,
+            last_assistant_only_loss=last_assistant_only_loss,
             settings=endprompt,
             example_index=example_index,
             tools=example.get("tools"),
@@ -539,6 +595,7 @@ def preprocess_example(
         tokenizer,
         max_sequence_length=max_sequence_length,
         assistant_only_loss=assistant_only_loss,
+        last_assistant_only_loss=last_assistant_only_loss,
         tools=example.get("tools"),
         chat_template_kwargs=example.get("chat_template_kwargs"),
     )
@@ -551,11 +608,17 @@ def preprocess_records(
     dataset_text_field: str,
     max_sequence_length: int,
     assistant_only_loss: bool = False,
+    last_assistant_only_loss: bool = False,
     endprompt: EndPromptSettings | None = None,
     example_index_offset: int = 0,
     allow_empty: bool = False,
 ) -> list[TokenizedExample]:
     """Preprocess an iterable of examples into materialized Python records."""
+
+    use_assistant_mask = _assistant_loss_mode(
+        assistant_only_loss=assistant_only_loss,
+        last_assistant_only_loss=last_assistant_only_loss,
+    ) is not None
 
     output = [
         preprocess_example(
@@ -564,16 +627,17 @@ def preprocess_records(
             dataset_text_field=dataset_text_field,
             max_sequence_length=max_sequence_length,
             assistant_only_loss=assistant_only_loss,
+            last_assistant_only_loss=last_assistant_only_loss,
             endprompt=endprompt,
             example_index=index,
         )
         for index, example in enumerate(records, start=example_index_offset)
     ]
-    if assistant_only_loss or endprompt is not None:
+    if use_assistant_mask or endprompt is not None:
         output = [
             example
             for example in output
-            if (not assistant_only_loss or _has_trainable_tokens(example))
+            if (not use_assistant_mask or _has_trainable_tokens(example))
             and (endprompt is None or _has_effective_loss_target(example))
         ]
         if not output and not allow_empty:
@@ -653,6 +717,7 @@ def preprocess_dataset(
     dataset_text_field: str,
     max_sequence_length: int,
     assistant_only_loss: bool = False,
+    last_assistant_only_loss: bool = False,
     endprompt: EndPromptSettings | None = None,
     num_proc: int | None = None,
     example_index_offset: int = 0,
@@ -665,6 +730,11 @@ def preprocess_dataset(
     removed so only model inputs remain.
     """
 
+    use_assistant_mask = _assistant_loss_mode(
+        assistant_only_loss=assistant_only_loss,
+        last_assistant_only_loss=last_assistant_only_loss,
+    ) is not None
+
     map_method = getattr(dataset, "map", None)
     if not callable(map_method):
         return preprocess_records(
@@ -673,6 +743,7 @@ def preprocess_dataset(
             dataset_text_field=dataset_text_field,
             max_sequence_length=max_sequence_length,
             assistant_only_loss=assistant_only_loss,
+            last_assistant_only_loss=last_assistant_only_loss,
             endprompt=endprompt,
             example_index_offset=example_index_offset,
             allow_empty=allow_empty,
@@ -685,6 +756,7 @@ def preprocess_dataset(
             dataset_text_field=dataset_text_field,
             max_sequence_length=max_sequence_length,
             assistant_only_loss=assistant_only_loss,
+            last_assistant_only_loss=last_assistant_only_loss,
             endprompt=endprompt,
             example_index=example_index_offset + index,
         )
@@ -718,7 +790,7 @@ def preprocess_dataset(
             "input_ids": DatasetSequence(Value("int64")),
             "attention_mask": DatasetSequence(Value("int64")),
         }
-        if assistant_only_loss:
+        if use_assistant_mask:
             output_features["assistant_masks"] = DatasetSequence(Value("int64"))
         if endprompt is not None:
             output_features["position_ids"] = DatasetSequence(Value("int64"))
@@ -730,12 +802,12 @@ def preprocess_dataset(
         map_kwargs["keep_in_memory"] = True
         map_kwargs["load_from_cache_file"] = False
     tokenized = map_method(tokenize_one, **map_kwargs)
-    if not assistant_only_loss and endprompt is None:
+    if not use_assistant_mask and endprompt is None:
         return tokenized
 
     def keep_example(example: Mapping[str, Any]) -> bool:
         return (
-            (not assistant_only_loss or _has_trainable_tokens(example))
+            (not use_assistant_mask or _has_trainable_tokens(example))
             and (endprompt is None or _has_effective_loss_target(example))
         )
 

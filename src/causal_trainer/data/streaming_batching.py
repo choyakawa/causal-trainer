@@ -185,7 +185,7 @@ def _canonical_record(
             raise ValueError("streaming assistant mask is not aligned with input_ids")
         canonical["assistant_masks"] = assistant
     elif assistant_only_loss:
-        raise ValueError("assistant_only_loss streaming record is missing assistant_masks")
+        raise ValueError("assistant-masked streaming record is missing assistant_masks")
 
     if "loss_weights" in record:
         weights = [float(value) for value in record["loss_weights"]]

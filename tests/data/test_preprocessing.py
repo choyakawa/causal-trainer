@@ -394,6 +394,96 @@ def test_assistant_only_trims_all_fields_at_last_trainable_token_in_prefix():
     }
 
 
+def test_last_assistant_only_loss_keeps_only_final_generation_span() -> None:
+    tokenizer = FakeTokenizer()
+    tokenizer.chat_output = {
+        "input_ids": list(range(10)),
+        "attention_mask": [1] * 10,
+        "assistant_masks": [0, 0, 1, 1, 0, 0, 1, 1, 0, 0],
+    }
+
+    output = tokenize_messages(
+        [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "earlier"},
+            {"role": "user", "content": "second"},
+            {"role": "assistant", "content": "final"},
+        ],
+        tokenizer,
+        max_sequence_length=10,
+        last_assistant_only_loss=True,
+    )
+
+    assert output == {
+        "input_ids": list(range(8)),
+        "attention_mask": [1] * 8,
+        "assistant_masks": [0, 0, 0, 0, 0, 0, 1, 1],
+    }
+    assert tokenizer.chat_calls[0][1]["return_assistant_tokens_mask"] is True
+    assert tokenizer.chat_calls[0][1]["truncation"] is False
+    assert tokenizer.chat_calls[0][1]["max_length"] is None
+
+
+def test_messages_endprompt_combines_last_assistant_and_prompt_loss_weights() -> None:
+    class ChatAnchorTokenizer(FakeTokenizer):
+        def __call__(self, text, **kwargs):
+            self.raw_calls.append((text, kwargs))
+            assert text == "anchor"
+            return {"input_ids": [90, 91]}
+
+    tokenizer = ChatAnchorTokenizer()
+    tokenizer.chat_output = {
+        "input_ids": [10, 11, 12, 13, 14, 15],
+        "attention_mask": [1] * 6,
+        "assistant_masks": [0, 1, 0, 0, 1, 1],
+    }
+    output = tokenize_endprompt_messages(
+        [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "earlier"},
+            {"role": "user", "content": "second"},
+            {"role": "assistant", "content": "final"},
+        ],
+        tokenizer,
+        max_sequence_length=8,
+        assistant_only_loss=False,
+        last_assistant_only_loss=True,
+        settings=EndPromptSettings(16, 16, ("anchor",), 0.25, 0.5),
+        example_index=0,
+    )
+
+    assert output == {
+        "input_ids": [10, 11, 12, 13, 14, 15, 90, 91],
+        "attention_mask": [1] * 8,
+        "assistant_masks": [0, 0, 0, 0, 1, 1, 0, 0],
+        "position_ids": [0, 1, 2, 3, 4, 5, 14, 15],
+        "loss_weights": [0.0, 0.0, 0.0, 0.0, 0.5, 0.5, 0.25, 0.25],
+    }
+
+
+def test_last_assistant_only_loss_does_not_fall_back_when_final_span_is_truncated() -> None:
+    tokenizer = FakeTokenizer()
+    tokenizer.chat_output = {
+        "input_ids": list(range(8)),
+        "attention_mask": [1] * 8,
+        "assistant_masks": [0, 1, 1, 0, 0, 0, 1, 1],
+    }
+
+    output = tokenize_messages(
+        [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "earlier"},
+            {"role": "user", "content": "second"},
+            {"role": "assistant", "content": "final"},
+        ],
+        tokenizer,
+        max_sequence_length=5,
+        last_assistant_only_loss=True,
+    )
+
+    assert output == {key: [] for key in tokenizer.chat_output}
+
+
 def test_assistant_only_records_filter_assistant_tokens_beyond_length_limit():
     class PerConversationTokenizer(FakeTokenizer):
         def apply_chat_template(self, messages, **kwargs):
@@ -524,6 +614,17 @@ def test_assistant_only_loss_is_rejected_for_raw_text():
             dataset_text_field="text",
             max_sequence_length=32,
             assistant_only_loss=True,
+        )
+
+
+def test_last_assistant_only_loss_is_rejected_for_raw_text():
+    with pytest.raises(ValueError, match="last_assistant_only_loss.*only for messages"):
+        preprocess_example(
+            {"text": "hello"},
+            FakeTokenizer(),
+            dataset_text_field="text",
+            max_sequence_length=32,
+            last_assistant_only_loss=True,
         )
 
 

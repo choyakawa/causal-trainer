@@ -21,6 +21,8 @@ def test_cli_accepts_reference_boolean_style() -> None:
     )
     assert args.packing is True
     assert args.assistant_only_loss is False
+    assert args.last_assistant_only_loss is False
+    assert args.uses_assistant_loss_mask is False
     assert args.sharding_axis == "-1,1,1,4,1"
     assert args.attn_mechanism == "efficient"
     assert args.loss_implementation == "auto"
@@ -841,3 +843,57 @@ def test_adapter_only_lora_accepts_optimizer_checkpointing() -> None:
     )
     assert args.save_optimizer_state is True
     assert args.lora_save_adapter_only is True
+
+
+def test_last_assistant_only_loss_accepts_messages_and_packing() -> None:
+    args = parse_args(
+        [
+            "--repo-id",
+            "local-model",
+            "--dataset-name",
+            "local-data",
+            "--dataset-text-field",
+            "messages",
+            "--last-assistant-only-loss",
+            "True",
+            "--packing",
+            "True",
+        ]
+    )
+
+    assert args.last_assistant_only_loss is True
+    assert args.assistant_only_loss is False
+    assert args.uses_assistant_loss_mask is True
+    assert args.packing is True
+
+
+def test_last_assistant_only_loss_requires_messages_field() -> None:
+    with pytest.raises(ValueError, match="last_assistant_only_loss requires"):
+        parse_args(
+            [
+                "--repo-id",
+                "local-model",
+                "--dataset-name",
+                "local-data",
+                "--last-assistant-only-loss",
+                "True",
+            ]
+        )
+
+
+def test_assistant_loss_modes_are_mutually_exclusive() -> None:
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        parse_args(
+            [
+                "--repo-id",
+                "local-model",
+                "--dataset-name",
+                "local-data",
+                "--dataset-text-field",
+                "messages",
+                "--assistant-only-loss",
+                "True",
+                "--last-assistant-only-loss",
+                "True",
+            ]
+        )

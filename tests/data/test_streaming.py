@@ -131,6 +131,151 @@ def test_packing_envelope_assigns_all_source_rows_to_packed_bins() -> None:
     assert first.records[0]["segment_ids"] == [1, 1, 1, 1, 2, 2]
 
 
+def test_streaming_last_assistant_only_loss_survives_packing_per_record() -> None:
+    class MultiTurnTokenizer:
+        def apply_chat_template(self, messages, **kwargs):
+            assert kwargs["return_assistant_tokens_mask"] is True
+            offset = 10 if messages[0]["content"] == "first-a" else 20
+            return {
+                "input_ids": [offset, offset + 1, offset + 2, offset + 3],
+                "attention_mask": [1, 1, 1, 1],
+                "assistant_masks": [0, 1, 0, 1],
+            }
+
+    def source(epoch: int):
+        del epoch
+        for suffix in ("a", "b"):
+            yield {
+                "messages": [
+                    {"role": "user", "content": f"first-{suffix}"},
+                    {"role": "assistant", "content": f"earlier-{suffix}"},
+                    {"role": "user", "content": f"last-{suffix}"},
+                    {"role": "assistant", "content": f"final-{suffix}"},
+                ]
+            }
+
+    first = next(
+        iter_streaming_batches(
+            source,
+            MultiTurnTokenizer(),
+            num_epochs=1,
+            dataset_text_field="messages",
+            max_sequence_length=8,
+            pad_token_id=0,
+            last_assistant_only_loss=True,
+            packing=True,
+            packing_batch_size=2,
+            retry_initial_delay=0,
+            retry_max_delay=0,
+        )
+    )
+
+    assert len(first.records) == 1
+    assert first.records[0]["segment_ids"] == [1, 1, 1, 1, 2, 2, 2, 2]
+    assert first.records[0]["assistant_masks"] == [0, 0, 0, 1, 0, 0, 0, 1]
+    assert first.records[0]["loss_weights"] == [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+
+
+@pytest.mark.parametrize("packing", [False, True], ids=["padding", "packing"])
+@pytest.mark.parametrize("loss_mode", ["assistant", "last_assistant"])
+def test_streaming_truncated_zero_loss_record_is_dropped_before_finalization(
+    packing: bool,
+    loss_mode: str,
+) -> None:
+    class TruncationTokenizer:
+        def apply_chat_template(self, messages, **kwargs):
+            assert kwargs["truncation"] is False
+            if messages[0]["content"] == "late":
+                assistant_masks = (
+                    [0] * 8 + [1, 1]
+                    if loss_mode == "assistant"
+                    else [0, 1, 1, 0, 0, 0, 0, 0, 1, 1]
+                )
+                return {
+                    "input_ids": list(range(90, 100)),
+                    "attention_mask": [1] * 10,
+                    "assistant_masks": assistant_masks,
+                }
+            offset = 10 if messages[0]["content"] == "kept-a" else 20
+            return {
+                "input_ids": [offset, offset + 1, offset + 2, offset + 3],
+                "attention_mask": [1, 1, 1, 1],
+                "assistant_masks": [0, 0, 1, 1],
+            }
+
+    def source(epoch: int):
+        del epoch
+        truncated_conversation = (
+            [
+                {"role": "user", "content": "late"},
+                {"role": "assistant", "content": "outside truncation limit"},
+            ]
+            if loss_mode == "assistant"
+            else [
+                {"role": "user", "content": "late"},
+                {"role": "assistant", "content": "earlier inside truncation limit"},
+                {"role": "user", "content": "follow-up"},
+                {"role": "assistant", "content": "final outside truncation limit"},
+            ]
+        )
+        yield {
+            "messages": truncated_conversation
+        }
+        yield {
+            "messages": [
+                {"role": "user", "content": "kept-a"},
+                {"role": "assistant", "content": "inside truncation limit a"},
+            ]
+        }
+        yield {
+            "messages": [
+                {"role": "user", "content": "kept-b"},
+                {"role": "assistant", "content": "inside truncation limit b"},
+            ]
+        }
+
+    first = next(
+        iter_streaming_batches(
+            source,
+            TruncationTokenizer(),
+            num_epochs=1,
+            dataset_text_field="messages",
+            max_sequence_length=8,
+            pad_token_id=0,
+            assistant_only_loss=loss_mode == "assistant",
+            last_assistant_only_loss=loss_mode == "last_assistant",
+            packing=packing,
+            packing_batch_size=3,
+            retry_initial_delay=0,
+            retry_max_delay=0,
+        )
+    )
+
+    assert first.source_examples == 3
+    if packing:
+        assert first.record_source_examples == (3,)
+        assert len(first.records) == 1
+        assert first.records[0]["input_ids"] == [10, 11, 12, 13, 20, 21, 22, 23]
+        assert first.records[0]["segment_ids"] == [1, 1, 1, 1, 2, 2, 2, 2]
+        assert first.records[0]["assistant_masks"] == [0, 0, 1, 1, 0, 0, 1, 1]
+        assert first.records[0]["loss_weights"] == [0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0]
+    else:
+        assert first.record_source_examples == (1, 2)
+        assert len(first.records) == 2
+        assert [record["input_ids"] for record in first.records] == [
+            [0, 0, 0, 0, 10, 11, 12, 13],
+            [0, 0, 0, 0, 20, 21, 22, 23],
+        ]
+        assert [record["assistant_masks"] for record in first.records] == [
+            [0, 0, 0, 0, 0, 0, 1, 1],
+            [0, 0, 0, 0, 0, 0, 1, 1],
+        ]
+        assert [record["loss_weights"] for record in first.records] == [
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0],
+        ]
+
+
 def test_filtered_rows_are_charged_to_the_last_prepared_record() -> None:
     def source(epoch: int):
         del epoch

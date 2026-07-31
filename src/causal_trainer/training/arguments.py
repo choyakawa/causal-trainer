@@ -71,6 +71,7 @@ class TrainingArguments:
     packing: bool
     packing_batch_size: int
     assistant_only_loss: bool
+    last_assistant_only_loss: bool
     endprompt_enable: bool
     endprompt_logical_length: int | None
     endprompt_logical_length_min: int | None
@@ -131,6 +132,10 @@ class TrainingArguments:
     @property
     def effective_batch_size(self) -> int:
         return self.total_batch_size * self.gradient_accumulation_steps
+
+    @property
+    def uses_assistant_loss_mask(self) -> bool:
+        return self.assistant_only_loss or self.last_assistant_only_loss
 
     @property
     def effective_endprompt_logical_length(self) -> int:
@@ -221,6 +226,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Per-JAX-process packing window; its final short window is retained.",
     )
     _add_bool(parser, "assistant_only_loss", False, "Supervise only chat-template generation spans.")
+    _add_bool(
+        parser,
+        "last_assistant_only_loss",
+        False,
+        "Supervise only the final chat-template generation span in each messages record.",
+    )
     _add_bool(
         parser,
         "endprompt_enable",
@@ -562,8 +573,15 @@ def parse_args(argv: list[str] | None = None) -> TrainingArguments:
         raise ValueError("learning rates must be non-negative and the initial rate must be positive")
     if args.learning_rate_end > args.learning_rate and args.scheduler != "constant":
         raise ValueError("learning_rate_end cannot exceed learning_rate for a decay schedule")
-    if args.assistant_only_loss and args.dataset_text_field != "messages":
-        raise ValueError("assistant_only_loss requires --dataset_text_field messages")
+    if args.assistant_only_loss and args.last_assistant_only_loss:
+        raise ValueError("assistant_only_loss and last_assistant_only_loss are mutually exclusive")
+    if args.uses_assistant_loss_mask and args.dataset_text_field != "messages":
+        option = (
+            "last_assistant_only_loss"
+            if args.last_assistant_only_loss
+            else "assistant_only_loss"
+        )
+        raise ValueError(f"{option} requires --dataset_text_field messages")
     if args.endprompt_enable:
         logical_max = args.effective_endprompt_logical_length
         logical_min = args.effective_endprompt_logical_length_min

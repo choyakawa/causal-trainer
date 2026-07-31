@@ -377,6 +377,7 @@ def iter_streaming_batches(
     max_sequence_length: int,
     pad_token_id: int,
     assistant_only_loss: bool = False,
+    last_assistant_only_loss: bool = False,
     endprompt: EndPromptSettings | None = None,
     packing: bool = False,
     packing_batch_size: int = 1000,
@@ -401,6 +402,9 @@ def iter_streaming_batches(
         raise ValueError("max_sequence_length must be positive")
     if packing_batch_size <= 0:
         raise ValueError("packing_batch_size must be positive")
+    if assistant_only_loss and last_assistant_only_loss:
+        raise ValueError("assistant_only_loss and last_assistant_only_loss are mutually exclusive")
+    use_assistant_mask = assistant_only_loss or last_assistant_only_loss
 
     for epoch in _epoch_indices(num_epochs):
         source = iter_retrying_records(
@@ -423,6 +427,7 @@ def iter_streaming_batches(
                 dataset_text_field=dataset_text_field,
                 max_sequence_length=max_sequence_length,
                 assistant_only_loss=assistant_only_loss,
+                last_assistant_only_loss=last_assistant_only_loss,
                 endprompt=endprompt,
                 example_index_offset=source_index,
                 allow_empty=True,
@@ -446,7 +451,7 @@ def iter_streaming_batches(
             normalized = tuple(
                 _ensure_loss_weights(
                     record,
-                    assistant_only_loss=assistant_only_loss,
+                    assistant_only_loss=use_assistant_mask,
                 )
                 for record in prepared
             )

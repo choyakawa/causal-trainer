@@ -144,3 +144,33 @@ def test_full_parameter_freezing_is_part_of_distributed_and_resume_identity() ->
         prepared_dummy_rows=0,
     )
     assert payload["arguments"]["frozen_parameters"] == "lm_head|embed|norm"
+
+
+def test_last_assistant_only_loss_is_part_of_distributed_and_resume_identity() -> None:
+    all_tokens = parse_args(
+        [
+            "--repo-id",
+            "local-model",
+            "--dataset-name",
+            "local-data",
+            "--dataset-text-field",
+            "messages",
+        ]
+    )
+    last_assistant = replace(all_tokens, last_assistant_only_loss=True)
+
+    assert _distributed_arguments_digest(all_tokens) != _distributed_arguments_digest(
+        last_assistant
+    )
+    payload = _resume_signature_payload(
+        last_assistant,
+        _Config(),
+        _Plan(),
+        SimpleNamespace(_fingerprint="synthetic"),
+        SimpleNamespace(shape={"dp": 1, "fsdp": 1, "ep": 1, "tp": 8, "sp": 4}),
+        preprocessing_process_count=8,
+        prepared_real_rows=1,
+        prepared_dummy_rows=0,
+    )
+
+    assert payload["arguments"]["last_assistant_only_loss"] is True

@@ -245,6 +245,162 @@ def test_tokenize_and_pack_transforms_do_not_create_arrow_cache_files() -> None:
     assert prepared.cache_files == []
 
 
+def test_last_assistant_only_loss_survives_packing_per_source_record() -> None:
+    class MultiTurnTokenizer:
+        pad_token_id = 0
+        eos_token_id = None
+
+        def apply_chat_template(self, messages, **kwargs):
+            assert kwargs["return_assistant_tokens_mask"] is True
+            offset = 10 if messages[0]["content"] == "first-a" else 20
+            return {
+                "input_ids": [offset, offset + 1, offset + 2, offset + 3],
+                "attention_mask": [1, 1, 1, 1],
+                "assistant_masks": [0, 1, 0, 1],
+            }
+
+    conversations = [
+        [
+            {"role": "user", "content": "first-a"},
+            {"role": "assistant", "content": "earlier-a"},
+            {"role": "user", "content": "last-a"},
+            {"role": "assistant", "content": "final-a"},
+        ],
+        [
+            {"role": "user", "content": "first-b"},
+            {"role": "assistant", "content": "earlier-b"},
+            {"role": "user", "content": "last-b"},
+            {"role": "assistant", "content": "final-b"},
+        ],
+    ]
+    prepared = prepare_training_dataset(
+        Dataset.from_dict({"messages": conversations}),
+        MultiTurnTokenizer(),
+        dataset_text_field="messages",
+        max_sequence_length=8,
+        assistant_only_loss=False,
+        last_assistant_only_loss=True,
+        endprompt=None,
+        packing=True,
+        packing_batch_size=2,
+        preprocessing_num_workers=None,
+    )
+    columns = packed_dataset_to_arrays(
+        prepared,
+        max_sequence_length=8,
+        assistant_only_loss=False,
+        last_assistant_only_loss=True,
+    )
+
+    assert len(prepared) == 1
+    np.testing.assert_array_equal(columns["segment_ids"], [[1, 1, 1, 1, 2, 2, 2, 2]])
+    np.testing.assert_array_equal(columns["assistant_masks"], [[0, 0, 0, 1, 0, 0, 0, 1]])
+    np.testing.assert_array_equal(columns["loss_weights"], [[0, 0, 0, 1, 0, 0, 0, 1]])
+
+
+@pytest.mark.parametrize("packing", [False, True], ids=["padding", "packing"])
+@pytest.mark.parametrize("loss_mode", ["assistant", "last_assistant"])
+def test_truncated_zero_loss_record_is_dropped_before_finalization(
+    packing: bool,
+    loss_mode: str,
+) -> None:
+    class TruncationTokenizer:
+        pad_token_id = 0
+        eos_token_id = None
+
+        def apply_chat_template(self, messages, **kwargs):
+            assert kwargs["truncation"] is False
+            if messages[0]["content"] == "late":
+                assistant_masks = (
+                    [0] * 8 + [1, 1]
+                    if loss_mode == "assistant"
+                    else [0, 1, 1, 0, 0, 0, 0, 0, 1, 1]
+                )
+                return {
+                    "input_ids": list(range(90, 100)),
+                    "attention_mask": [1] * 10,
+                    "assistant_masks": assistant_masks,
+                }
+            offset = 10 if messages[0]["content"] == "kept-a" else 20
+            return {
+                "input_ids": [offset, offset + 1, offset + 2, offset + 3],
+                "attention_mask": [1, 1, 1, 1],
+                "assistant_masks": [0, 0, 1, 1],
+            }
+
+    truncated_conversation = (
+        [
+            {"role": "user", "content": "late"},
+            {"role": "assistant", "content": "outside truncation limit"},
+        ]
+        if loss_mode == "assistant"
+        else [
+            {"role": "user", "content": "late"},
+            {"role": "assistant", "content": "earlier inside truncation limit"},
+            {"role": "user", "content": "follow-up"},
+            {"role": "assistant", "content": "final outside truncation limit"},
+        ]
+    )
+    conversations = [
+        truncated_conversation,
+        [
+            {"role": "user", "content": "kept-a"},
+            {"role": "assistant", "content": "inside truncation limit a"},
+        ],
+        [
+            {"role": "user", "content": "kept-b"},
+            {"role": "assistant", "content": "inside truncation limit b"},
+        ],
+    ]
+    assistant_only_loss = loss_mode == "assistant"
+    last_assistant_only_loss = loss_mode == "last_assistant"
+    prepared = prepare_training_dataset(
+        Dataset.from_dict({"messages": conversations}),
+        TruncationTokenizer(),
+        dataset_text_field="messages",
+        max_sequence_length=8,
+        assistant_only_loss=assistant_only_loss,
+        last_assistant_only_loss=last_assistant_only_loss,
+        endprompt=None,
+        packing=packing,
+        packing_batch_size=2,
+        preprocessing_num_workers=None,
+    )
+    columns = packed_dataset_to_arrays(
+        prepared,
+        max_sequence_length=8,
+        assistant_only_loss=assistant_only_loss,
+        last_assistant_only_loss=last_assistant_only_loss,
+    )
+
+    if packing:
+        assert len(prepared) == 1
+        np.testing.assert_array_equal(
+            columns["input_ids"],
+            [[10, 11, 12, 13, 20, 21, 22, 23]],
+        )
+        np.testing.assert_array_equal(columns["segment_ids"], [[1, 1, 1, 1, 2, 2, 2, 2]])
+        np.testing.assert_array_equal(columns["assistant_masks"], [[0, 0, 1, 1, 0, 0, 1, 1]])
+        np.testing.assert_array_equal(columns["loss_weights"], [[0, 0, 1, 1, 0, 0, 1, 1]])
+    else:
+        assert len(prepared) == 2
+        np.testing.assert_array_equal(
+            columns["input_ids"],
+            [
+                [0, 0, 0, 0, 10, 11, 12, 13],
+                [0, 0, 0, 0, 20, 21, 22, 23],
+            ],
+        )
+        np.testing.assert_array_equal(
+            columns["assistant_masks"],
+            [
+                [0, 0, 0, 0, 0, 0, 1, 1],
+                [0, 0, 0, 0, 0, 0, 1, 1],
+            ],
+        )
+        np.testing.assert_array_equal(columns["loss_weights"], columns["assistant_masks"])
+
+
 def test_real_selected_dataset_uses_global_endprompt_row_indices() -> None:
     class PromptTokenizer:
         def __call__(self, text, **kwargs):

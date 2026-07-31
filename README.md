@@ -67,7 +67,7 @@ causal-train \
   --output_dir ./output-sft
 ```
 
-Assistant-only supervision requires a chat template that marks assistant generation spans with `{% generation %}` and `{% endgeneration %}`. Records without a valid supervised target after truncation are filtered.
+Assistant-only supervision requires a chat template that marks assistant generation spans with `{% generation %}` and `{% endgeneration %}`. `--assistant_only_loss True` supervises every marked assistant span. Use `--last_assistant_only_loss True` instead to supervise only the final contiguous marked assistant span in each source conversation. The two options are mutually exclusive and require `--dataset_text_field messages`. Records without a valid supervised target after truncation are filtered.
 
 ## Model and tokenizer sources
 
@@ -134,6 +134,8 @@ Transient Hugging Face network, transport, and server read failures are retried 
 ### Packing
 
 Enable fixed-length packing with `--packing True`. Each source record receives an independent segment ID, and position IDs restart at the beginning of each segment. Attention and shifted language-model loss both enforce segment boundaries.
+
+With `--last_assistant_only_loss True`, the final assistant span is selected independently in every source conversation before packing. A packed row therefore retains one final supervised span per trainable source record, while cross-record prediction edges remain masked by segment IDs.
 
 `--packing_batch_size` controls the per-process packing window. The final short window is retained.
 

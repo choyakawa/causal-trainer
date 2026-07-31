@@ -348,6 +348,7 @@ def _resume_signature_payload(
         "packing_batch_size",
         "streaming_shuffle_buffer",
         "assistant_only_loss",
+        "last_assistant_only_loss",
         "endprompt_enable",
         "endprompt_logical_length",
         "endprompt_logical_length_min",
@@ -844,6 +845,7 @@ def main(argv: list[str] | None = None) -> None:
                 dataset_text_field=args.dataset_text_field,
                 max_sequence_length=args.max_sequence_length,
                 assistant_only_loss=args.assistant_only_loss,
+                last_assistant_only_loss=args.last_assistant_only_loss,
                 endprompt=endprompt,
                 packing=args.packing,
                 packing_batch_size=args.packing_batch_size,
@@ -855,6 +857,7 @@ def main(argv: list[str] | None = None) -> None:
                 prepared_shard,
                 max_sequence_length=args.max_sequence_length,
                 assistant_only_loss=args.assistant_only_loss,
+                last_assistant_only_loss=args.last_assistant_only_loss,
             )
             del prepared_shard
         except Exception as exc:
@@ -1307,7 +1310,7 @@ def main(argv: list[str] | None = None) -> None:
             "loss_implementation": loss_implementation,
             "mlp_chunk_size": args.mlp_chunk_size,
             "scan_layers": args.scan_layers,
-            "sparse_loss_skip": args.assistant_only_loss,
+            "sparse_loss_skip": args.uses_assistant_loss_mask,
             "optimizer_state_shardings": optimizer_state_shardings,
             "batch_named_sharding": input_sharding,
             "replicated_named_sharding": scalar_sharding,
@@ -1471,6 +1474,7 @@ def main(argv: list[str] | None = None) -> None:
             max_sequence_length=args.max_sequence_length,
             pad_token_id=int(pad_token_id),
             assistant_only_loss=args.assistant_only_loss,
+            last_assistant_only_loss=args.last_assistant_only_loss,
             endprompt=endprompt,
             packing=args.packing,
             packing_batch_size=args.packing_batch_size,
@@ -1480,7 +1484,7 @@ def main(argv: list[str] | None = None) -> None:
         host_batches = iter_streaming_global_batches(
             packing_windows,
             plan,
-            assistant_only_loss=args.assistant_only_loss,
+            assistant_only_loss=args.uses_assistant_loss_mask,
             start_step=start_step,
             expected_source_examples_before=(
                 resume_checkpoint.source_examples_seen
@@ -1595,7 +1599,7 @@ def main(argv: list[str] | None = None) -> None:
         host_batches = iter_global_batches(
             dataset,
             plan,
-            assistant_only_loss=args.assistant_only_loss,
+            assistant_only_loss=args.uses_assistant_loss_mask,
             shuffle=args.shuffle,
             seed=args.seed,
             start_step=start_step,
